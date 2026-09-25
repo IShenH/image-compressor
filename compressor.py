@@ -5,8 +5,8 @@
 因此可以脱离 GUI 独立运行和测试。
 
 对外提供两个函数：
-    read_info(path)                          读取一张图片的基本信息
-    compress(src, dst, level, output_format)  压缩并输出到指定位置
+    read_info(path)    读取一张图片的基本信息
+    compress(...)      压缩并输出到指定位置
 """
 
 import io
@@ -55,6 +55,18 @@ LEVELS = {
     "balanced": 75,
     "high": 85,
 }
+
+# PNG 没有质量参数，真正能大幅减小体积的手段是「调色板量化」——
+# 把真彩色（每像素 3 字节、最多 1600 万色）降成索引色（每像素 ≤1 字节、≤256 色）。
+# 这是**有损**的，TinyPNG / pngquant 宣传的「压缩 70%」靠的就是它。
+# 这里把档位映射成允许的颜色数。实测（1254×1254 插画）：
+#     256 色 → 占原图 33.9%   128 色 → 27.6%   64 色 → 22.0%
+PNG_COLORS = {"small": 64, "balanced": 128, "high": 256}
+
+# 量化前先看 alpha 通道有多少种取值。调色板 PNG 的透明是「每个索引一个 alpha 值」，
+# 不是逐像素 alpha，所以半透明渐变会被压成几个台阶（实测 102 级 → 6 级）。
+# 只有 alpha 足够简单（典型情况是「透明 / 不透明」两态，例如图标和 logo）才敢量化。
+ALPHA_LEVELS_CAP = 8
 
 # 输出格式 → 文件扩展名
 EXTENSIONS = {"JPEG": ".jpg", "PNG": ".png", "WEBP": ".webp"}
@@ -110,6 +122,9 @@ class CompressResult:
     output_path: str
     output_size_bytes: int
     output_format: str
+    output_width: int
+    output_height: int
+    quantized_colors: "int | None" = None  # 量化用的颜色数；None 表示未量化
     suggestion: "Suggestion | None" = None
 
     @property
@@ -123,6 +138,12 @@ class CompressResult:
         if self.source.size_bytes == 0:
             return 0.0
         return self.output_size_bytes / self.source.size_bytes
+
+    @property
+    def resized(self) -> bool:
+        """尺寸是否被缩小过。"""
+        return (self.output_width, self.output_height) != (
+            self.source.width, self.source.height)
 
 
 def _has_alpha(img) -> bool:
@@ -213,6 +234,51 @@ def _encode(img, fmt: str, level: str, lossless: bool = False):
     return buf.getvalue()
 
 
+def _alpha_allows_quantize(img) -> bool:
+    """透明信息足够简单时，才敢做减色。
+
+    调色板 PNG 的透明只能表达成「每个索引配一个 alpha 值」（或单一透明色），
+    不是逐像素 alpha。实测一张有 102 级 alpha 渐变的图，减色后只剩 6 级台阶，肉眼可见。
+    而常见的图标 / logo 只有「透明 / 不透明」两态，减色对它毫无影响。
+    """
+    if not _has_alpha(img):
+        return True
+    colors = img.getchannel("A").getcolors(maxcolors=ALPHA_LEVELS_CAP)
+    return colors is not None  # None 表示超过上限，即 alpha 太复杂
+
+
+def _encode_quantized(img, colors: int):
+    """把真彩色降成索引色（有损），返回 PNG 字节；失败返回 None。
+
+    注意 Pillow 的硬限制：**RGBA 图只能用 FASTOCTREE**，
+    传 MEDIANCUT 会直接抛 ValueError。RGB 图则优先用画质更好的 MEDIANCUT。
+    """
+    buf = io.BytesIO()
+    try:
+        if _has_alpha(img):
+            quantized = img.quantize(colors=colors, method=Image.FASTOCTREE)
+        else:
+            quantized = img.convert("RGB").quantize(
+                colors=colors, method=Image.MEDIANCUT)
+        quantized.save(buf, format="PNG", optimize=True)
+    except Exception:
+        return None
+    return buf.getvalue()
+
+
+def _downscale(img, max_dimension):
+    """把最长边限制到 max_dimension 以内。**只缩小，不放大。**"""
+    if not max_dimension:
+        return img
+    width, height = img.size
+    longest = max(width, height)
+    if longest <= max_dimension:
+        return img  # 本来就够小，一点也不动它
+    scale = max_dimension / longest
+    new_size = (max(1, round(width * scale)), max(1, round(height * scale)))
+    return img.resize(new_size, Image.Resampling.LANCZOS)
+
+
 def _looks_like_flat_graphic(img, info: ImageInfo, level: str) -> bool:
     """判断这张图是不是「扁平图形 / 界面截图」类内容。
 
@@ -233,15 +299,32 @@ def _looks_like_flat_graphic(img, info: ImageInfo, level: str) -> bool:
 
 
 def _best_in_format(img, info: ImageInfo, fmt: str, level: str):
-    """在**同一个格式内**挑最优参数，返回 (字节, 说明) 或 None。"""
+    """在**同一个格式内**挑最优参数。
+
+    返回 (字节, 量化色数)：字节为 None 表示这个格式装不下这张图。
+    """
+    if fmt == "PNG":
+        # 已经是索引色、而目标色数又是 256（等于索引色的上限）时，
+        # 再量化一次只会白白损失画质，直接无损保存。
+        if img.mode == "P" and PNG_COLORS[level] >= 256:
+            return _encode(img, "PNG", level), None
+        # PNG 没有质量旋钮，靠「减色」才能大幅变小 —— 但那是有损的。
+        # 透明信息太复杂时减色会明显劣化，那就退回无损优化。
+        if _alpha_allows_quantize(img):
+            data = _encode_quantized(img, PNG_COLORS[level])
+            if data is not None and len(data) < info.size_bytes:
+                return data, PNG_COLORS[level]
+        return _encode(img, "PNG", level), None
+
     if fmt == "WEBP":
         lossy = _encode(img, "WEBP", level)
         if _looks_like_flat_graphic(img, info, level):
             lossless = _encode(img, "WEBP", level, lossless=True)
             if lossless is not None and (lossy is None or len(lossless) < len(lossy)):
-                return lossless
-        return lossy
-    return _encode(img, fmt, level)
+                return lossless, None
+        return lossy, None
+
+    return _encode(img, fmt, level), None
 
 
 def _pick_target_format(info: ImageInfo, requested) -> str:
@@ -277,11 +360,13 @@ def _alternatives_for(info: ImageInfo, exclude: str):
     return [a for a in alts if a != exclude]
 
 
-def compress(src: str, dst: str, level: str = "balanced", output_format=None) -> CompressResult:
+def compress(src: str, dst: str, level: str = "balanced", output_format=None,
+             max_dimension=None) -> CompressResult:
     """把 src 压缩后保存到 dst，返回压缩结果。
 
     level          三个档位之一，见 LEVELS
     output_format  目标格式；None 表示保持源格式（默认）
+    max_dimension  最长边上限（像素）；None 表示不改尺寸。**只缩小，不放大。**
 
     如果无论如何都压不小，会抛 NoGainError —— 宁可不产出，也不给用户一个更大的文件。
     """
@@ -298,21 +383,37 @@ def compress(src: str, dst: str, level: str = "balanced", output_format=None) ->
     if os.path.normcase(os.path.abspath(src)) == os.path.normcase(os.path.abspath(dst)):
         raise CompressError("输出路径和原图是同一个文件，这会覆盖原图。请另选保存位置。")
 
+    if max_dimension is not None:
+        try:
+            max_dimension = int(max_dimension)
+        except (TypeError, ValueError):
+            raise CompressError(f"尺寸上限必须是整数，收到：{max_dimension!r}")
+        if max_dimension < 1:
+            raise CompressError("尺寸上限必须大于 0。")
+
     target = _pick_target_format(info, output_format)
 
     with Image.open(src) as img:
         img.load()  # 先解码一次，后面要反复编码，避免每次都重新解
 
-        data = _best_in_format(img, info, target, level)
+        # 尺寸调整放在所有编码之前 —— 这样每个候选方案都在同一张「最终尺寸」的图上比较，
+        # 而且缩小尺寸能同时降低后续所有编码的耗时。
+        img = _downscale(img, max_dimension)
+        out_width, out_height = img.size
+
+        data, quantized = _best_in_format(img, info, target, level)
         if data is None:
             raise CompressError(f"这张图片无法保存成 {target} 格式。")
 
         # ---- 尝试替代格式：既用于「压不动时的兜底」，也用于生成建议 ----
         suggestion = None
         alts = _alternatives_for(info, target)
-        if alts and (1 - len(data) / info.size_bytes) < SKIP_SUGGESTION_ABOVE:
+        # 保格式已经省下很多时就不再多花时间算替代方案（WebP 编码很慢）。
+        # 但如果这次用的是有损手段（PNG 减色），用户可能更愿意换格式而不是丢颜色，所以照算。
+        worth_checking = (1 - len(data) / info.size_bytes) < SKIP_SUGGESTION_ABOVE or quantized
+        if alts and worth_checking:
             for alt in alts:
-                ad = _best_in_format(img, info, alt, level)
+                ad, _ = _best_in_format(img, info, alt, level)
                 if ad is None:
                     continue
                 if suggestion is None or len(ad) < suggestion.size_bytes:
@@ -342,7 +443,7 @@ def compress(src: str, dst: str, level: str = "balanced", output_format=None) ->
                 for other in LEVELS:
                     if other == level:
                         continue
-                    d2 = _best_in_format(img, info, target, other)
+                    d2, _ = _best_in_format(img, info, target, other)
                     if d2 is not None and len(d2) < info.size_bytes:
                         raise NoGainError(
                             f"这张图在「{level}」档位下压不小，"
@@ -374,5 +475,8 @@ def compress(src: str, dst: str, level: str = "balanced", output_format=None) ->
         output_path=dst,
         output_size_bytes=len(data),
         output_format=target,
+        output_width=out_width,
+        output_height=out_height,
+        quantized_colors=quantized,
         suggestion=suggestion,
     )
