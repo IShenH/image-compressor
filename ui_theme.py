@@ -80,7 +80,10 @@ class Metrics:
         # 控件
         self.btn_h = s(70)            # 通栏按钮高（设计稿 70）
         self.btn_h_small = s(46)
-        self.card_h = s(170)          # 档位卡片高
+        self.card_h = s(132)          # 档位卡片高
+        # 设计稿上是 s(170)，但那是按「两行说明」定的高度；
+        # 我们省略装饰插画后说明只剩一行，照搬会让卡片下半空一大块。
+        # 卡片高度属于内部比例，不影响整窗 1.777 的约束。
         self.preview_w = s(150)       # 预览缩略图宽
         self.preview_h = s(118)
         self.title_bar_h = s(56)
@@ -191,6 +194,9 @@ def init(root, margin=8):
         client_h = int(round(client_w * RATIO))
 
     M = Metrics(client_w / float(REF_W), client_w, client_h)
+    # 尺寸变了，之前按旧尺寸缓存的字体与图片都不能再用
+    clear_cache()
+    _font_cache.clear()
     return client_w, client_h
 
 
@@ -216,6 +222,22 @@ def photo(image, key=None):
 def clear_cache():
     _photo_cache.clear()
     del _keep_alive[:]
+
+
+_font_cache = {}
+
+
+def font_obj(ref_size, bold=False):
+    """取一个缓存的 tkfont.Font（量文字宽度要用它）。
+
+    ref_size 是**设计稿上的字号**，内部会按 k 换算成像素。
+    """
+    key = (int(ref_size), bool(bold))
+    if key not in _font_cache:
+        _font_cache[key] = tkfont.Font(family=FONT_FAMILY,
+                                       size=-M.s(ref_size),
+                                       weight="bold" if bold else "normal")
+    return _font_cache[key]
 
 
 # ---------------------------------------------------------------- 常用素材

@@ -79,10 +79,17 @@ def aa_mask(size, radius=0, corners=(True, True, True, True)):
 
     d = ImageDraw.Draw(mask)
     # 横向铺满的一竖条（左右各按圆角情况收进 r）
-    d.rectangle([r if tl else 0, 0, w - 1 - (r if tr else 0), h - 1], fill=255)
+    # ⚠️ 半径等于宽度一半时（正圆），这条会退化成 x0 > x1，必须跳过，
+    #    否则 Pillow 抛 "x1 must be greater than or equal to x0"。
+    x0 = r if tl else 0
+    x1 = w - 1 - (r if tr else 0)
+    if x1 >= x0:
+        d.rectangle([x0, 0, x1, h - 1], fill=255)
     # 纵向铺满的一横条（上下各按圆角情况收进 r）
-    d.rectangle([0, r if (tl or tr) else 0, w - 1,
-                 h - 1 - (r if (bl or br) else 0)], fill=255)
+    y0 = r if (tl or tr) else 0
+    y1 = h - 1 - (r if (bl or br) else 0)
+    if y1 >= y0:
+        d.rectangle([0, y0, w - 1, y1], fill=255)
     # 只有这一步带抗锯齿
     spots = {"tl": (0, 0), "tr": (w - r, 0), "br": (w - r, h - r), "bl": (0, h - r)}
     for which, on in (("tl", tl), ("tr", tr), ("br", br), ("bl", bl)):
@@ -150,6 +157,50 @@ def hline(size, color, thickness=1):
     t = max(1, int(round(thickness)))
     img = Image.new("RGBA", (W, t), to_rgba(color))
     return img
+
+
+def dashed_round_rect(size, radius=0, color="#C9C2B8", width=1, dash=5, gap=4):
+    """虚线圆角框（拖放区用）。
+
+    Pillow 没有现成的虚线，所以沿四条直边按「画 dash、跳 gap」逐段描；
+    四个圆角太小（半径约 9px），虚线在上面看不出来，直接画实线弧。
+    """
+    w, h = max(1, int(size[0])), max(1, int(size[1]))
+    W, H = w * SS, h * SS
+    img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    col = to_rgba(color)
+    r = int(max(0, min(radius, w // 2, h // 2))) * SS
+    lw = max(1, int(round(width * SS)))
+    period = max(2, (dash + gap)) * SS
+    on = max(1, dash * SS)
+
+    def dash_line(p0, p1):
+        dx, dy = p1[0] - p0[0], p1[1] - p0[1]
+        length = math.hypot(dx, dy)
+        if length <= 0:
+            return
+        ux, uy = dx / length, dy / length
+        t = 0.0
+        while t < length:
+            e = min(t + on, length)
+            d.line([(p0[0] + ux * t, p0[1] + uy * t),
+                    (p0[0] + ux * e, p0[1] + uy * e)], fill=col, width=lw)
+            t += period
+
+    dash_line((r, 0), (W - r - 1, 0))          # 上
+    dash_line((W - 1, r), (W - 1, H - r - 1))  # 右
+    dash_line((W - r - 1, H - 1), (r, H - 1))  # 下
+    dash_line((0, H - r - 1), (0, r))          # 左
+
+    if r > 0:
+        for which, a0, a1 in (("tl", 180, 270), ("tr", 270, 360),
+                              ("br", 0, 90), ("bl", 90, 180)):
+            cx, cy = {"tl": (r, r), "tr": (W - 1 - r, r),
+                      "br": (W - 1 - r, H - 1 - r), "bl": (r, H - 1 - r)}[which]
+            d.arc([cx - r, cy - r, cx + r, cy + r], a0, a1, fill=col, width=lw)
+
+    return img.resize((w, h), Image.LANCZOS)
 
 
 def hgradient(size, left, right, radius=0, corners=(True, True, True, True)):
