@@ -79,8 +79,8 @@ class Metrics:
         s = self.s = lambda v: max(1, int(round(v * k)))   # noqa: E731
 
         # 间距与圆角。间距刻意压到最小（用户要求），不再按设计稿的宽松留白走。
-        self.page_pad = s(13)
-        self.gap = s(12)
+        self.page_pad = s(8)
+        self.gap = s(4)
         self.card_pad_x = s(20)
         self.card_pad_y = s(16)
         self.row_gap = s(6)
