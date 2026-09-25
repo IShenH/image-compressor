@@ -191,10 +191,14 @@ class App:
         """
         m = T.M
         pad = m.page_pad
+        bottom = m.bottom_pad
         inner = self.win_w - 2 * pad
 
         header = m.s(52)          # 区块标题行（图标 + 标题 + 分隔线）
-        row = m.s(40)             # 信息行高
+        # ⚠️ 必须与 _draw_info_card / _draw_result_labels 里的行高一致。
+        # 曾经这里写 s(40) 而绘制用 s(46)，卡片高度就比实际内容少算 16px，
+        # 信息区最后一行被挤到卡片边缘。
+        row = m.s(46)
         hint = m.s(22)            # 灰提示行
 
         heights = {
@@ -210,20 +214,29 @@ class App:
             "save": m.btn_h,
         }
         order = ["drop", "info", "level", "size", "compress", "result", "save"]
-        gap = m.gap               # 间距压到最小
-        n_gaps = len(order) - 1
 
-        total = 2 * pad + sum(heights.values()) + gap * n_gaps
+        # 区块间距：默认压到最小，个别相邻对单独调。
+        # 键是「上面那一块」的 key，值是与它下面那一块的间距。
+        # 为什么这几对要不同 —— 间距在视觉上表达的是「这两块有多亲」：
+        #   全站统一 3px 时，所有卡片等距排列，看不出内容分组。
+        gap_after = {
+            "info": m.s(9),      # 档位卡与原图信息分开一点：都是卡片，贴太近像一张被切开
+            "compress": m.s(3),  # 结果紧跟按钮 —— 它们是一组「操作 → 结果」，要最紧
+            "result": m.s(16),   # 保存按钮与结果拉开：它是对整页结果的收尾，不是结果的一行
+        }
+        gaps = [gap_after.get(k, m.gap) for k in order[:-1]]
+
+        total = pad + bottom + sum(heights.values()) + sum(gaps)
         if total > self.max_h:
-            room = self.max_h - 2 * pad - gap * n_gaps
+            room = self.max_h - pad - bottom - sum(gaps)
             scale = room / float(sum(heights.values()))
             heights = {k: max(m.s(30), int(v * scale)) for k, v in heights.items()}
-            total = 2 * pad + sum(heights.values()) + gap * n_gaps
+            total = pad + bottom + sum(heights.values()) + sum(gaps)
 
         rects, y = {}, pad
-        for key in order:
+        for key, g in zip(order, gaps + [0]):
             rects[key] = (pad, y, inner, heights[key])
-            y += heights[key] + gap
+            y += heights[key] + g
         return rects, total
 
     # ---------------- 摆放与显隐 ----------------
@@ -735,7 +748,8 @@ class App:
         """
         m = T.M
         w, h = m.preview_w, m.preview_h
-        img = ui_draw.rounded_rect((w, h), m.radius_small, fill="#EDEAE4")
+        r = m.radius                  # 框大了，小圆角会显得局促
+        img = ui_draw.rounded_rect((w, h), r, fill="#EDEAE4")
 
         if self.thumb_pil is not None:
             photo = self.thumb_pil
@@ -745,13 +759,13 @@ class App:
                                  Image.LANCZOS)
             left, top = (photo.width - w) // 2, (photo.height - h) // 2
             photo = photo.crop((left, top, left + w, top + h))
-            img.paste(photo, (0, 0), ui_draw.aa_mask((w, h), m.radius_small))
+            img.paste(photo, (0, 0), ui_draw.aa_mask((w, h), r))
         else:
-            glyph = ui_draw.icon("image", m.s(64), "#C6C0B7", stroke=1.4)
+            glyph = ui_draw.icon("image", m.s(96), "#C6C0B7", stroke=1.4)
             img.alpha_composite(glyph, ((w - glyph.width) // 2,
                                         (h - glyph.height) // 2))
 
-        img.alpha_composite(ui_draw.rounded_rect((w, h), m.radius_small,
+        img.alpha_composite(ui_draw.rounded_rect((w, h), r,
                                                  outline=T.BORDER_SOFT, width=1))
         self.thumb = T.photo(img, key=("preview", w, h, self._thumb_ver))
         self.preview.delete("all")

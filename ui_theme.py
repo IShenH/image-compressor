@@ -79,8 +79,9 @@ class Metrics:
         s = self.s = lambda v: max(1, int(round(v * k)))   # noqa: E731
 
         # 间距与圆角。间距刻意压到最小（用户要求），不再按设计稿的宽松留白走。
-        self.page_pad = s(8)
-        self.gap = s(4)
+        self.page_pad = s(8)            # 顶部与左右外边距
+        self.bottom_pad = s(20)         # 底部留白比顶部大一点，视觉上有收束感
+        self.gap = s(4)                 # 区块间距的默认值（个别相邻对在 main 里单独调）
         self.card_pad_x = s(20)
         self.card_pad_y = s(16)
         self.row_gap = s(6)
@@ -92,8 +93,10 @@ class Metrics:
         self.btn_h = s(54)            # 通栏按钮高
         self.btn_h_small = s(40)
         self.card_h = s(100)          # 档位卡片高
-        self.preview_w = s(102)       # 预览缩略图宽
-        self.preview_h = s(76)
+        # 预览缩略图：高度要与右侧四行信息（4 × s(46)）基本齐平，卡片才不会一边空一边满。
+        # 比例取 4:3。
+        self.preview_w = s(243)
+        self.preview_h = s(182)
 
         # 字号（负号 = 像素）。数值比设计稿大 —— 布局全部按设备像素走，
         # 字号若照抄设计稿比例，在 150% 缩放的屏幕上会明显偏小。
