@@ -90,10 +90,6 @@ build/smoke/smoke.exe
 
 | 文件 | 内容 |
 | --- | --- |
-| `PROJECT.md` | 项目目标、原则、边界 |
-| `ROADMAP.md` | 阶段划分与进度 |
-| `TASKS.md` | 当前任务 |
-| `AGENTS.md` | 协作规则 |
 | `docs/decisions/` | 重大选择的决策记录（ADR） |
 | `docs/engineering/` | 系统当前如何组织 |
 | `docs/research/` | 压缩实验的实测数据 |
