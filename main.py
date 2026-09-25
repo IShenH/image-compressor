@@ -94,6 +94,8 @@ class App:
         self.tmp_base = os.path.join(self.tmpdir, "compressed")
 
         self.level = tk.StringVar(value=DEFAULT_LEVEL)
+        self.limit_size = tk.BooleanVar(value=False)
+        self.max_dimension = tk.StringVar(value="1920")
 
         self._build_ui()
         self._refresh_buttons()
@@ -139,6 +141,26 @@ class App:
             ttk.Radiobutton(level_box, text=name, value=key, variable=self.level,
                             command=self._on_level_change).grid(row=i, column=0, sticky="w")
             ttk.Label(level_box, text=desc).grid(row=i, column=1, sticky="w", padx=(12, 0))
+        ttk.Label(level_box, foreground="#777", wraplength=300, justify="left",
+                  text="PNG 没有质量参数，靠减色变小（会丢颜色）"
+                  ).grid(row=len(LEVEL_CHOICES), column=0, columnspan=2,
+                         sticky="w", pady=(6, 0))
+        row += 1
+
+        # ---- 输出尺寸 ----
+        size_box = ttk.LabelFrame(outer, text="输出尺寸", padding=(12, 8, 12, 10))
+        size_box.grid(row=row, column=0, sticky="ew", pady=(12, 0))
+        ttk.Checkbutton(size_box, text="限制最长边", variable=self.limit_size,
+                        command=self._on_size_change).grid(row=0, column=0, sticky="w")
+        self.size_spin = ttk.Spinbox(size_box, from_=64, to=20000, increment=100,
+                                     width=7, textvariable=self.max_dimension,
+                                     command=self._on_size_change)
+        self.size_spin.grid(row=0, column=1, sticky="w", padx=(8, 4))
+        # 手动输入不会触发 command，得单独监听按键，否则结果会停留在旧尺寸上
+        self.size_spin.bind("<KeyRelease>", lambda _e: self._on_size_change())
+        ttk.Label(size_box, text="像素").grid(row=0, column=2, sticky="w")
+        ttk.Label(size_box, foreground="#777", text="只缩小，不放大"
+                  ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(4, 0))
         row += 1
 
         # ---- 执行压缩 ----
@@ -155,25 +177,27 @@ class App:
         self.result_vars = {}
         for i, (key, title) in enumerate([
                 ("before", "压缩前"), ("after", "压缩后"),
-                ("saved", "减少"), ("format", "输出格式")]):
+                ("saved", "减少"), ("format", "输出格式"),
+                ("dimensions", "输出尺寸")]):
             ttk.Label(result_box, text=f"{title}：").grid(row=i, column=0, sticky="w", pady=1)
             var = tk.StringVar(value="—")
             ttk.Label(result_box, textvariable=var).grid(row=i, column=1, sticky="w", pady=1)
             self.result_vars[key] = var
 
+        last = len(self.result_vars)
         self.note_label = ttk.Label(result_box, text="", wraplength=300, justify="left")
-        self.note_label.grid(row=4, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        self.note_label.grid(row=last, column=0, columnspan=2, sticky="w", pady=(6, 0))
         self.note_label.grid_remove()
 
         # 建议按钮：只有在「换个做法能压得更小」时才出现。
         # 是否换格式由用户点它决定 —— 程序不擅自替他改格式（requirement.md §7）。
         self.suggest_btn = ttk.Button(result_box, text="", command=self.apply_suggestion)
-        self.suggest_btn.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        self.suggest_btn.grid(row=last + 1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         self.suggest_btn.grid_remove()
 
         self.restore_btn = ttk.Button(result_box, text="恢复原格式",
                                       command=self.restore_format)
-        self.restore_btn.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        self.restore_btn.grid(row=last + 2, column=0, columnspan=2, sticky="ew", pady=(4, 0))
         self.restore_btn.grid_remove()
         row += 1
 
@@ -219,6 +243,11 @@ class App:
         self._clear_result()
         self._refresh_buttons()
 
+    def _on_size_change(self):
+        """尺寸选项一变，同理作废上次结果。"""
+        self._clear_result()
+        self._refresh_buttons()
+
     def _reset_format_choice(self):
         self.force_format = None
 
@@ -243,10 +272,12 @@ class App:
         # 先让界面重绘一次。不调用的话，鼠标忙碌光标要等压缩跑完才出现，
         # 用户会觉得程序卡死了 —— 因为 tkinter 只在「空闲」时才刷新界面。
         self.root.update_idletasks()
+        # 只有勾了「限制最长边」才传这个参数；没勾时传 None，表示完全不动尺寸
+        max_dim = self.max_dimension.get().strip() if self.limit_size.get() else None
         try:
             self.result = compressor.compress(
                 self.info.path, self.tmp_base, self.level.get(),
-                output_format=self.force_format)
+                output_format=self.force_format, max_dimension=max_dim)
             self.pending_suggestion = self.result.suggestion
             self.pending_level = None
         except compressor.NoGainError as exc:
@@ -314,7 +345,15 @@ class App:
         r = self.result
         self.result_vars["before"].set(format_size(r.source.size_bytes))
         self.result_vars["after"].set(format_size(r.output_size_bytes))
-        self.result_vars["format"].set(FORMAT_LABELS.get(r.output_format, r.output_format))
+
+        fmt_text = FORMAT_LABELS.get(r.output_format, r.output_format)
+        if r.quantized_colors:
+            # 减色是**有损**的，必须让用户看见，不能假装它还和原来一样无损
+            fmt_text += f"（{r.quantized_colors} 色，减色有损）"
+        self.result_vars["format"].set(fmt_text)
+
+        dims = f"{r.output_width} × {r.output_height}"
+        self.result_vars["dimensions"].set(dims + "（已缩小）" if r.resized else dims)
 
         gain = 1 - r.ratio
         self.result_vars["saved"].set(f"{gain * 100:.1f}%")
