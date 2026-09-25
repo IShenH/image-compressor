@@ -117,9 +117,11 @@ def compress(src: str, dst: str, level: str = "balanced") -> CompressResult:
 
     # 3. M1 只处理 JPEG
     if info.format != "JPEG":
+        # 这句话会原样弹到用户面前，所以不写内部的阶段编号，只讲用户关心的事。
+        # 为什么不支持、什么时候支持，属于开发计划，留在本注释里就够了。
         raise CompressError(
-            f"M1 目前只支持 JPEG，而这张是 {info.format}。"
-            "其他格式要按图片类型分流处理，计划在 M3 完成。"
+            f"目前只支持 JPEG 图片，而这张是 {info.format}。\n"
+            "截图、插画等其他格式会在后续版本支持。"
         )
 
     # 4. 原图安全：拒绝写到原图路径上。
