@@ -25,7 +25,7 @@ import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox
 
-from PIL import ImageDraw
+from PIL import Image, ImageDraw
 
 import compressor
 import ui_draw
@@ -153,8 +153,9 @@ class App:
         self._drop_ready = False  # 拖放只能挂一次窗口过程，不能重复挂
         self.header_h = {}
 
-        self.win_w, self.win_h = T.init(root)
-        self.rects = self._compute_layout()
+        self.win_w, self.max_h = T.init(root)
+        self.win_h = self.max_h      # 初值；_relayout 会按内容实际需要改
+        self.rects = {}
 
         self._build_ui()
         self._refresh_buttons()
@@ -167,61 +168,63 @@ class App:
         """结果卡片里三个可选元素占多高 —— 只算**当前显示的**。
 
         如果无条件预留，「提示 / 建议按钮 / 恢复按钮」不显示时卡片底部会空一大块。
+        ⚠️ 这里的算法必须和 `_draw_result_labels` 里推进 y 的方式**完全一致**，
+        否则算出来的卡片高度和实际摆放的位置对不上，下面的按钮会被压住。
         """
         m = T.M
+        gap = m.s(6)
         total = 0
         if self._extra["note"]:
-            total += m.s(26) + m.s(8)
+            total += m.s(26) + gap
         if self._extra["suggest"]:
-            total += m.s(40) + m.s(8)
+            total += m.s(40) + gap
         if self._extra["restore"]:
-            total += m.s(34) + m.s(8)
+            total += m.s(34) + gap
         return total
 
     def _compute_layout(self):
-        """算出每个区块的位置和大小。
+        """算出每个区块的位置，并返回 (坐标表, 内容总高)。
 
-        卡片高度由**内容**算出来（标题行 + 若干信息行 + 内边距），
-        剩余空间平均分给间距 —— 这样既不会挤，也不会出现「某块空一大半」。
-        屏幕太小时按比例压缩，宁可挤一点也不能让底部超出屏幕。
+        窗口高度**由内容决定**，不再套设计稿的 1.777 比例 ——
+        间距按最小给，没有再分配剩余空间，所以内容多高窗口就多高。
+        只有一种例外：内容超过屏幕可用高度时按比例压缩，宁可挤也不能被裁。
         """
         m = T.M
         pad = m.page_pad
         inner = self.win_w - 2 * pad
 
-        header = m.s(56)          # 区块标题行（图标 + 标题 + 分隔线）
-        row = m.s(46)             # 信息行高
-        hint = m.s(26)            # 灰提示行
+        header = m.s(52)          # 区块标题行（图标 + 标题 + 分隔线）
+        row = m.s(40)             # 信息行高
+        hint = m.s(22)            # 灰提示行
 
         heights = {
-            "drop": m.s(250),
+            "drop": m.s(130),
             "info": header + max(m.preview_h, len(INFO_ROWS) * row) + 2 * m.card_pad_y,
             "level": header + m.card_h + hint + 2 * m.card_pad_y,
             "size": header + m.btn_h_small + hint + 2 * m.card_pad_y,
-            # 压缩按钮下方留出进度条的位置（进度条平时藏着，但位置要占住，
+            # 压缩按钮下方给进度条留一条缝（平时藏着，但位置要占住，
             # 否则一压缩下面的东西就整体往下跳）
-            "compress": m.btn_h + m.s(22),
+            "compress": m.btn_h + m.s(20),
             # 高度随三个可选元素的显隐变化，不无条件预留（理由见 _extra_height）
             "result": header + 3 * row + self._extra_height() + 2 * m.card_pad_y,
             "save": m.btn_h,
         }
         order = ["drop", "info", "level", "size", "compress", "result", "save"]
-        gaps = len(order) - 1
-        min_gap = m.s(14)
-        available = self.win_h - 2 * pad
+        gap = m.gap               # 间距压到最小
+        n_gaps = len(order) - 1
 
-        if sum(heights.values()) + gaps * min_gap > available:
-            scale = (available - gaps * min_gap) / float(sum(heights.values()))
-            heights = {k: max(m.s(40), int(v * scale)) for k, v in heights.items()}
-
-        slack = available - sum(heights.values())
-        gap = max(min_gap, slack // gaps)
+        total = 2 * pad + sum(heights.values()) + gap * n_gaps
+        if total > self.max_h:
+            room = self.max_h - 2 * pad - gap * n_gaps
+            scale = room / float(sum(heights.values()))
+            heights = {k: max(m.s(30), int(v * scale)) for k, v in heights.items()}
+            total = 2 * pad + sum(heights.values()) + gap * n_gaps
 
         rects, y = {}, pad
         for key in order:
             rects[key] = (pad, y, inner, heights[key])
             y += heights[key] + gap
-        return rects
+        return rects, total
 
     # ---------------- 摆放与显隐 ----------------
 
@@ -250,8 +253,7 @@ class App:
         self.root.title(f"图片压缩工具 {__version__}")
         self.root.configure(bg=T.PAGE_BG)
         self.root.resizable(False, False)
-        # 定位要算上边框开销：geometry 设的是客户区，按客户区居中会整体偏右下
-        self.root.geometry(T.center_geometry(self.root, self.win_w, self.win_h))
+        self.root.geometry(T.geometry_for(self.root, self.win_w, self.win_h))
         try:
             self.root.iconphoto(True, T.photo(ui_draw.app_icon(64), key="appicon"))
         except Exception:
@@ -279,15 +281,21 @@ class App:
                                      outline=T.BORDER, width=1), (x, y))
 
         # ---- 拖放区（虚线框，表示可拖入）----
+        # 文案在左、按钮在右，压成一行 —— 最省高度，也最接近设计稿的横向排布
         x, y, w, h = self.rects["drop"]
         bg.alpha_composite(
             ui_draw.dashed_round_rect((w, h), m.radius, color="#CFC8BE",
                                       width=1, dash=6, gap=5), (x, y))
         d = ImageDraw.Draw(bg)
-        d.text((x + w // 2, y + int(h * 0.24)), "选择图片或拖拽到这里",
-               font=T.pil_font(24, bold=True), fill=T.TEXT_STRONG, anchor="mm")
-        d.text((x + w // 2, y + int(h * 0.45)), "支持常见的图片格式（JPG、PNG、WEBP 等）",
-               font=T.pil_font(18), fill=T.TEXT_MUTED, anchor="mm")
+        left = x + m.s(44)
+        d.text((left, y + h // 2 - m.s(15)), "选择图片或拖拽到这里",
+               font=T.pil_font(24, bold=True), fill=T.TEXT_STRONG, anchor="lm")
+        d.text((left, y + h // 2 + m.s(16)), "支持常见的图片格式（JPG、PNG、WEBP 等）",
+               font=T.pil_font(18), fill=T.TEXT_MUTED, anchor="lm")
+        btn_w, btn_h = m.s(250), m.s(66)
+        # 按钮位置记下来，_apply_positions 要用
+        self.drop_btn = (x + w - m.s(44) - btn_w, y + (h - btn_h) // 2,
+                         btn_w, btn_h)
 
         # ---- 各卡片内的静态内容 ----
         self.header_h["info"] = self._draw_header(bg, "info", "image", "原图信息")
@@ -330,15 +338,9 @@ class App:
         ix = x + m.card_pad_x
         top = self.header_h["info"]
 
-        # 预览框底（里头的缩略图是动态的，运行时再贴）
+        # 预览框由 preview 控件自己画，不画在背景图上 ——
+        # 否则贴在上面的 Label 是方形的，会盖不住圆角、露出直角
         self.preview_box = (ix, top, m.preview_w, m.preview_h)
-        bg.alpha_composite(
-            ui_draw.rounded_rect((m.preview_w, m.preview_h), m.radius_small,
-                                 fill="#EDEAE4", outline=T.BORDER_SOFT, width=1),
-            (ix, top))
-        ph = ui_draw.icon("image", m.s(64), "#C6C0B7", stroke=1.4)
-        bg.alpha_composite(ph, (ix + (m.preview_w - ph.width) // 2,
-                                top + (m.preview_h - ph.height) // 2))
 
         # 右侧四行：图标 + 静态标签
         row = m.s(46)
@@ -376,9 +378,9 @@ class App:
         ix = x + m.card_pad_x
         top = self.header_h["size"]
         self.size_row_y = top
-        self.size_check_w = m.s(230)
+        self.size_check_w = m.s(150)
         self.size_field_x = ix + self.size_check_w + m.s(16)
-        self.size_field_w = m.s(150)
+        self.size_field_w = m.s(110)
         d.text((self.size_field_x + self.size_field_w + m.s(12),
                 top + m.btn_h_small // 2), "像素",
                font=T.pil_font(19), fill=T.TEXT, anchor="lm")
@@ -421,20 +423,34 @@ class App:
             self.result_value_x[key] = int(right_x + m.s(26) + m.s(10)
                                            + T.pil_font(19).getlength(text) + m.s(12))
 
-        self.result_note_y = top + 3 * row + m.s(6)
-        self.result_suggest_y = self.result_note_y + m.s(26) + m.s(6)
-        self.result_restore_y = self.result_suggest_y + m.s(40) + m.s(6)
+        # 三个可选元素的位置**按实际显示的依次往下排** ——
+        # 不能无条件按「三个都显示」算，否则中间某个不显示时，
+        # 下面的元素位置就会偏出卡片，把保存按钮压住。
+        gap = m.s(6)
+        y = top + 3 * row + gap
+        self.result_note_y = y
+        if self._extra["note"]:
+            y += m.s(26) + gap
+        self.result_suggest_y = y
+        if self._extra["suggest"]:
+            y += m.s(40) + gap
+        self.result_restore_y = y
         self.card_inner_x = ix
         self.card_inner_w = w - 2 * m.card_pad_x
 
     def _relayout(self):
-        """重新算布局、重画背景、重新摆放控件。
+        """重新算布局、重画背景、重新摆放控件，必要时调整窗口高度。
 
         什么时候需要：结果区里「提示行 / 建议按钮 / 恢复原格式按钮」的显隐变了。
-        它们不显示时整页必须收上去 —— 无条件预留位置会让卡片底部空一大块。
-        整页背景重画一次约 25ms，察觉不到。
+        它们不显示时整页必须收上去，窗口也随之变矮 —— 不留任何空白。
         """
-        self.rects = self._compute_layout()
+        rects, total_h = self._compute_layout()
+        self.rects = rects
+        if total_h != self.win_h:
+            self.win_h = total_h
+            self.root.geometry(T.geometry_for(self.root, self.win_w, self.win_h))
+            self.bg.configure(width=self.win_w, height=self.win_h)
+        # 布局版本号变了，背景图缓存键跟着变，否则会拿到上一版的旧图
         self._layout_ver += 1
         self._draw_background()
         self._apply_positions()
@@ -449,8 +465,13 @@ class App:
         self.choose_btn = W.FlatButton(self.bg, text="选择图片…", icon="folder",
                                        kind="primary", command=self.choose_file,
                                        bg=T.PAGE_BG)
-        self.preview_label = tk.Label(self.bg, bg="#EDEAE4", bd=0,
-                                      highlightthickness=0)
+        # 预览框用 Canvas 自己画（圆角底 + 图片或占位图标）。
+        # 不用 Label 贴图：Label 的背景是方的，盖不住背景图上的圆角框，会露出直角。
+        self.preview = tk.Canvas(self.bg, bg=T.CARD_BG, bd=0,
+                                 highlightthickness=0)
+        self.thumb_pil = None      # 原始缩略图（PIL）；重排时重新合成
+        self.thumb = None          # 最终贴上去的 PhotoImage
+        self._thumb_ver = 0
         self.info_labels = {}
         for key in self.info_vars:
             lbl = W.label(self.bg, size=19, color=T.TEXT)
@@ -505,15 +526,15 @@ class App:
         """按最新算出的坐标摆放全部控件，并同步与布局相关的尺寸。"""
         m = T.M
 
-        # ---- 拖放区 ----
-        x, y, w, h = self.rects["drop"]
-        bw = m.s(250)
-        self.choose_btn.configure(width=bw, height=m.s(78))
-        self._reg(self.choose_btn, x=x + (w - bw) // 2, y=y + int(h * 0.56))
+        # ---- 拖放区：文案在左、按钮在右 ----
+        bx, by, bw, bh = self.drop_btn
+        self.choose_btn.configure(width=bw, height=bh)
+        self._reg(self.choose_btn, x=bx, y=by)
 
         # ---- 原图信息：预览框 + 四个数值 ----
         bx, by, pw, ph = self.preview_box
-        self._reg(self.preview_label, x=bx, y=by, width=pw, height=ph)
+        self._reg(self.preview, x=bx, y=by, width=pw, height=ph)
+        self._draw_preview()
         for i, key in enumerate(self.info_vars):
             self._reg(self.info_labels[key], x=self.info_value_x,
                       y=self.info_row_y + i * self.info_row_h,
@@ -569,7 +590,6 @@ class App:
     def _visibility(self):
         """按「有没有图 / 是否在压缩 / 三个可选元素的状态」统一刷一遍显隐。"""
         pairs = [
-            (self.preview_label, bool(self.thumb)),
             (self.progress, self.busy),
             (self.note_label, self._extra["note"]),
             (self.suggest_btn, self._extra["suggest"]),
@@ -691,27 +711,51 @@ class App:
     # ---------------- 预览 ----------------
 
     def _show_preview(self, path):
-        """在原图信息左侧显示缩略图。
+        """读出缩略图并重画预览框。
 
-        两个必须注意的点：
-        1. 先 thumbnail 再转 PhotoImage，大图直接塞进控件会吃掉几百兆内存
-        2. PhotoImage 必须留引用，否则被垃圾回收后界面显示成一片空白
+        必须先 thumbnail 再存 —— 4000×3000 的图直接塞进控件会吃掉几百兆内存。
         """
         m = T.M
         try:
-            from PIL import Image
             with Image.open(path) as img:
                 img = img.convert("RGBA")
-                box = (self.preview_box[2] - m.s(8), self.preview_box[3] - m.s(8))
-                img.thumbnail(box, Image.LANCZOS)
-                from PIL import ImageTk
-                self.thumb = ImageTk.PhotoImage(img)
+                # 存三倍大小，重排时重新裁切不会糊
+                img.thumbnail((m.preview_w * 3, m.preview_h * 3), Image.LANCZOS)
+                self.thumb_pil = img
         except Exception:
-            self.thumb = None
-            self._visibility()
-            return
-        self.preview_label.configure(image=self.thumb)
-        self._visibility()
+            self.thumb_pil = None
+        self._thumb_ver += 1
+        self._draw_preview()
+
+    def _draw_preview(self):
+        """画预览框：圆角底 + 图片（或占位图标）+ 细边框。
+
+        图片按「铺满并居中裁切」放置再套上圆角遮罩，这样不会变形、
+        四角也能和卡片底自然衔接。
+        """
+        m = T.M
+        w, h = m.preview_w, m.preview_h
+        img = ui_draw.rounded_rect((w, h), m.radius_small, fill="#EDEAE4")
+
+        if self.thumb_pil is not None:
+            photo = self.thumb_pil
+            scale = max(w / float(photo.width), h / float(photo.height))
+            photo = photo.resize((max(1, int(photo.width * scale)),
+                                  max(1, int(photo.height * scale))),
+                                 Image.LANCZOS)
+            left, top = (photo.width - w) // 2, (photo.height - h) // 2
+            photo = photo.crop((left, top, left + w, top + h))
+            img.paste(photo, (0, 0), ui_draw.aa_mask((w, h), m.radius_small))
+        else:
+            glyph = ui_draw.icon("image", m.s(64), "#C6C0B7", stroke=1.4)
+            img.alpha_composite(glyph, ((w - glyph.width) // 2,
+                                        (h - glyph.height) // 2))
+
+        img.alpha_composite(ui_draw.rounded_rect((w, h), m.radius_small,
+                                                 outline=T.BORDER_SOFT, width=1))
+        self.thumb = T.photo(img, key=("preview", w, h, self._thumb_ver))
+        self.preview.delete("all")
+        self.preview.create_image(0, 0, anchor="nw", image=self.thumb)
 
     # ---------------- 事件处理 ----------------
 
