@@ -141,8 +141,9 @@ class App:
             ttk.Radiobutton(level_box, text=name, value=key, variable=self.level,
                             command=self._on_level_change).grid(row=i, column=0, sticky="w")
             ttk.Label(level_box, text=desc).grid(row=i, column=1, sticky="w", padx=(12, 0))
-        ttk.Label(level_box, foreground="#777", wraplength=300, justify="left",
-                  text="PNG 没有质量参数，靠减色变小（会丢颜色）"
+        # 文案要短：系统缩放 125%/150% 时字体会等比放大，长文案会折成难看的碎片
+        ttk.Label(level_box, foreground="#777",
+                  text="PNG 只能靠减色变小（有损）"
                   ).grid(row=len(LEVEL_CHOICES), column=0, columnspan=2,
                          sticky="w", pady=(6, 0))
         row += 1
