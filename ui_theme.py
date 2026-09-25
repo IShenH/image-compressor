@@ -22,7 +22,18 @@ import ui_draw
 # ---------------------------------------------------------------- 设计稿基准
 REF_W = 941
 REF_H = 1672
-RATIO = REF_H / REF_W            # 1.7770（16:9 竖版）
+
+# 窗口宽度（**逻辑像素**）。实际值会乘系统 DPI 缩放 ——
+# 之前直接用设备像素定尺寸，等于忽略了用户的 150% 缩放设置，字看着就偏小。
+WIN_W_LOGICAL = 467
+
+# 系统 DPI 缩放系数，由 init() 实测（本机 150% → 1.5）
+DPI_SCALE = 1.0
+
+
+def lv(x):
+    """逻辑像素 → 设备像素。"""
+    return max(1, int(round(x * DPI_SCALE)))
 
 # 设计稿配色（Pillow 取样所得）
 PAGE_BG = "#F3EEE7"       # 页面底色
@@ -60,35 +71,32 @@ FONT_CANDIDATES = ("Microsoft YaHei UI", "微软雅黑", "Microsoft YaHei",
 class Metrics:
     """按缩放系数算出来的实际尺寸。由 init() 填充。"""
 
-    def __init__(self, k, win_w, win_h):
+    def __init__(self, k, win_w, max_h):
         self.k = k
         self.window_w = win_w
-        self.window_h = win_h
+        self.max_h = max_h          # 可用高度上限；**实际窗口高度由内容决定**
 
         s = self.s = lambda v: max(1, int(round(v * k)))   # noqa: E731
 
-        # 间距与圆角
-        self.page_pad = s(20)
-        self.gap = s(14)
-        self.card_pad_x = s(26)
-        self.card_pad_y = s(20)
-        self.row_gap = s(7)
-        self.radius = s(14)
-        self.radius_small = s(10)
+        # 间距与圆角。间距刻意压到最小（用户要求），不再按设计稿的宽松留白走。
+        self.page_pad = s(13)
+        self.gap = s(12)
+        self.card_pad_x = s(20)
+        self.card_pad_y = s(16)
+        self.row_gap = s(6)
+        self.radius = s(12)
+        self.radius_small = s(8)
         self.border_w = 1
 
         # 控件
-        self.btn_h = s(70)            # 通栏按钮高（设计稿 70）
-        self.btn_h_small = s(46)
-        self.card_h = s(132)          # 档位卡片高
-        # 设计稿上是 s(170)，但那是按「两行说明」定的高度；
-        # 我们省略装饰插画后说明只剩一行，照搬会让卡片下半空一大块。
-        # 卡片高度属于内部比例，不影响整窗 1.777 的约束。
-        self.preview_w = s(150)       # 预览缩略图宽
-        self.preview_h = s(118)
-        self.title_bar_h = s(56)
+        self.btn_h = s(54)            # 通栏按钮高
+        self.btn_h_small = s(40)
+        self.card_h = s(100)          # 档位卡片高
+        self.preview_w = s(102)       # 预览缩略图宽
+        self.preview_h = s(76)
 
-        # 字号（负号 = 像素）
+        # 字号（负号 = 像素）。数值比设计稿大 —— 布局全部按设备像素走，
+        # 字号若照抄设计稿比例，在 150% 缩放的屏幕上会明显偏小。
         self.fs_title_bar = -s(26)
         self.fs_drop_main = -s(24)
         self.fs_drop_sub = -s(18)
@@ -104,8 +112,8 @@ class Metrics:
 
 FONT_FAMILY = "Microsoft YaHei UI"
 
-# 默认值来自本机实测（1920×1080 @150%）。init() 会按实际工作区重算。
-M = Metrics(572.0 / REF_W, 572, 1016)
+# 默认值来自本机实测（1920×1080 @150%）。init() 会按实际屏幕重算。
+M = Metrics(700.0 / REF_W, 700, 1016)
 
 
 # ---------------------------------------------------------------- 屏幕测算
@@ -164,26 +172,32 @@ def frame_overhead(root):
     return _frame_cache
 
 
-def center_geometry(root, w, h):
-    """居中摆放的 geometry 字符串。
+_anchor_y = 4
 
-    ⚠️ 必须把边框开销算进去：`geometry()` 设的是**客户区**，
-    按客户区居中会让整个窗口偏右下（外框比客户区大一圈）。
+
+def geometry_for(root, w, h):
+    """窗口 geometry 字符串。
+
+    水平居中；垂直固定在同一锚点上 —— 窗口高度会随内容变化，
+    如果每次重新居中，高度一变整窗就会往上跳一下。
+    ⚠️ 水平居中要算上边框开销（`geometry()` 设的是客户区）。
     """
     area = work_area() or (root.winfo_screenwidth(), root.winfo_screenheight())
-    fw, fh = _frame_cache
+    fw, _ = _frame_cache
     x = max(0, (area[0] - (w + fw)) // 2)
-    y = max(0, (area[1] - (h + fh)) // 2)
-    return "%dx%d+%d+%d" % (w, h, x, y)
+    return "%dx%d+%d+%d" % (w, h, x, _anchor_y)
 
 
 def init(root, margin=8):
-    """按实际屏幕算出窗口尺寸与所有尺寸参数，返回 (宽, 高)。
+    """按实际屏幕算出窗口宽度与尺寸参数，返回 (宽, 可用高度上限)。
 
-    设计稿比例固定为 1.7770，所以先定高度（受工作区限制），再反推宽度 ——
-    这样在任何屏幕上都不会出现「按图做完了，底部被任务栏裁掉」。
+    **高度不再固定按设计稿比例**：窗口高度由内容决定（见 App._compute_layout）。
+    这里只负责给出宽度和「最高能有多高」，剩下交给界面层。
+
+    宽度用**逻辑像素 × DPI 缩放** —— 直接拿设备像素当尺寸等于忽略用户的缩放设置，
+    字会明显偏小。
     """
-    global M, FONT_FAMILY
+    global M, FONT_FAMILY, DPI_SCALE, _anchor_y
 
     try:
         families = set(tkfont.families(root))
@@ -194,29 +208,32 @@ def init(root, margin=8):
     except Exception:
         pass
 
+    # 真实的系统缩放：DPI 感知打开后，1 英寸等于多少像素 ÷ 96
+    try:
+        DPI_SCALE = max(1.0, root.winfo_fpixels("1i") / 96.0)
+    except Exception:
+        DPI_SCALE = 1.0
+
     area = work_area()
     if area is None:
         area = (root.winfo_screenwidth(), root.winfo_screenheight())
     avail_w, avail_h = area
 
     _, frame_h = frame_overhead(root)
+    max_h = avail_h - frame_h - margin
 
-    client_h = avail_h - frame_h - margin
-    client_w = int(round(client_h / RATIO))
-    # 极窄屏兜底：宽度不能小于 420，否则内容挤不成样子
-    if client_w < 420:
-        client_w = 420
-        client_h = int(round(client_w * RATIO))
-    if client_w > avail_w - margin:
-        client_w = avail_w - margin
-        client_h = int(round(client_w * RATIO))
+    win_w = min(lv(WIN_W_LOGICAL), avail_w - margin)
+    win_w = max(420, win_w)
 
-    M = Metrics(client_w / float(REF_W), client_w, client_h)
+    M = Metrics(win_w / float(REF_W), win_w, max_h)
     # 尺寸变了，之前按旧尺寸缓存的字体与图片都不能再用
     clear_cache()
     _font_cache.clear()
     _pil_font_cache.clear()
-    return client_w, client_h
+
+    # 垂直位置固定在这个锚点上。高度一变只向下长，不整体跳一下。
+    _anchor_y = max(4, (avail_h - max_h) // 2)
+    return win_w, max_h
 
 
 # ---------------------------------------------------------------- 图片缓存
