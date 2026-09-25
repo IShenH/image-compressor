@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
-"""图片压缩工具 —— 界面层（M2）。
+"""图片压缩工具 —— 界面层。
 
 这一层只负责「给用户看什么」和「用户点了什么」，
 真正的压缩算法全部在 compressor 模块里，这里一行都不碰。
 
-界面流程（对应 ROADMAP 的 M2）：
+界面流程：
     选择图片 → 查看信息 → 设置压缩目标 → 压缩 → 查看结果 → 保存
 """
 
@@ -25,6 +25,9 @@ LEVEL_CHOICES = [
     ("high", "高画质", "尽量保住画质"),
 ]
 DEFAULT_LEVEL = "balanced"
+
+# 格式在界面上的写法
+FORMAT_LABELS = {"JPEG": "JPEG", "PNG": "PNG", "WEBP": "WebP"}
 
 # 压缩收益低于这个比例时，如实提示用户「省得不多」（见 requirement.md §5）
 LOW_GAIN_THRESHOLD = 0.10
@@ -67,9 +70,11 @@ def format_size(num_bytes):
 class App:
     """主窗口。
 
-    界面上的按钮能不能点，完全由两个变量决定：
-        self.info    —— 当前选中的原图信息，没有它就不能压缩
-        self.result  —— 最近一次压缩的结果，没有它就不能保存
+    界面上的按钮能不能点，完全由几个变量决定：
+        self.info       —— 当前选中的原图信息，没有它就不能压缩
+        self.result     —— 最近一次压缩的结果，没有它就不能保存
+        self.pending_suggestion —— 有没有「换个格式/档位能更好」的建议
+        self.force_format       —— 用户是否主动要求了某个输出格式
     这样就不用到处手动开关按钮，状态只有一个来源。
     """
 
@@ -78,19 +83,21 @@ class App:
 
         self.info = None
         self.result = None
+        self.pending_suggestion = None
+        self.pending_level = None
+        self.force_format = None
 
         # 压缩结果先落到临时目录，用户点「保存」时才复制到他选定的位置。
         # 这样「压缩 → 看结果 → 决定存到哪」这个顺序才成立，
         # 也避免在用户还没决定之前就往他的磁盘上写东西。
         self.tmpdir = tempfile.mkdtemp(prefix="imgcomp_")
-        self.tmp_output = os.path.join(self.tmpdir, "compressed.jpg")
+        self.tmp_base = os.path.join(self.tmpdir, "compressed")
 
         self.level = tk.StringVar(value=DEFAULT_LEVEL)
 
         self._build_ui()
         self._refresh_buttons()
 
-        # 关窗口时顺手清掉临时目录
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # ---------------- 界面搭建 ----------------
@@ -142,19 +149,32 @@ class App:
         # ---- 压缩结果 ----
         result_box = ttk.LabelFrame(outer, text="压缩结果", padding=(12, 8, 12, 10))
         result_box.grid(row=row, column=0, sticky="ew", pady=(12, 0))
+        # 只有数值列（第 1 列）吸收多余宽度。
+        # 不给第 0 列权重，否则标签列会撑开、把数值挤到窗口最右边甚至裁掉。
+        result_box.columnconfigure(1, weight=1)
         self.result_vars = {}
         for i, (key, title) in enumerate([
-                ("before", "压缩前"), ("after", "压缩后"), ("saved", "减少")]):
+                ("before", "压缩前"), ("after", "压缩后"),
+                ("saved", "减少"), ("format", "输出格式")]):
             ttk.Label(result_box, text=f"{title}：").grid(row=i, column=0, sticky="w", pady=1)
             var = tk.StringVar(value="—")
             ttk.Label(result_box, textvariable=var).grid(row=i, column=1, sticky="w", pady=1)
             self.result_vars[key] = var
-        self.note_label = ttk.Label(result_box, text="", wraplength=340, justify="left")
-        self.note_label.grid(row=len(self.result_vars), column=0, columnspan=2,
-                             sticky="w", pady=(6, 0))
-        # 没有提示要显示时，让它彻底退出布局，否则结果框底部会留一块空白。
-        # 用 grid_remove 而不是 grid_forget：前者会记住这里的行号列号，之后再 grid() 就能原样回来。
+
+        self.note_label = ttk.Label(result_box, text="", wraplength=300, justify="left")
+        self.note_label.grid(row=4, column=0, columnspan=2, sticky="w", pady=(6, 0))
         self.note_label.grid_remove()
+
+        # 建议按钮：只有在「换个做法能压得更小」时才出现。
+        # 是否换格式由用户点它决定 —— 程序不擅自替他改格式（requirement.md §7）。
+        self.suggest_btn = ttk.Button(result_box, text="", command=self.apply_suggestion)
+        self.suggest_btn.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        self.suggest_btn.grid_remove()
+
+        self.restore_btn = ttk.Button(result_box, text="恢复原格式",
+                                      command=self.restore_format)
+        self.restore_btn.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        self.restore_btn.grid_remove()
         row += 1
 
         # ---- 保存 ----
@@ -167,7 +187,8 @@ class App:
         """弹出文件选择框。真正的加载逻辑在 load_file 里，方便单独测试。"""
         path = filedialog.askopenfilename(
             title="选择要压缩的图片",
-            filetypes=[("JPEG 图片", "*.jpg *.jpeg *.JPG *.JPEG"), ("所有文件", "*.*")],
+            filetypes=[("所有支持的图片", "*.jpg *.jpeg *.png *.webp *.bmp *.gif *.tif *.tiff"),
+                       ("所有文件", "*.*")],
         )
         if path:
             self.load_file(path)
@@ -185,7 +206,8 @@ class App:
         self.info_vars["dimensions"].set(f"{self.info.width} × {self.info.height}")
         self.info_vars["size_bytes"].set(format_size(self.info.size_bytes))
 
-        # 换了图片，上一次的压缩结果就作废了
+        # 换了图片，上一次的结果和用户之前要求的格式都作废
+        self._reset_format_choice()
         self._clear_result()
         self._refresh_buttons()
 
@@ -197,6 +219,22 @@ class App:
         self._clear_result()
         self._refresh_buttons()
 
+    def _reset_format_choice(self):
+        self.force_format = None
+
+    def apply_suggestion(self):
+        """采纳建议：按建议换格式或换档位重新压一次。"""
+        if self.pending_level:
+            self.level.set(self.pending_level)
+        if self.pending_suggestion:
+            self.force_format = self.pending_suggestion.format
+        self.do_compress()
+
+    def restore_format(self):
+        """放弃格式转换，回到保持源格式。"""
+        self._reset_format_choice()
+        self.do_compress()
+
     def do_compress(self):
         if self.info is None:
             return
@@ -207,10 +245,21 @@ class App:
         self.root.update_idletasks()
         try:
             self.result = compressor.compress(
-                self.info.path, self.tmp_output, self.level.get())
-        except compressor.CompressError as exc:
-            messagebox.showerror("压缩失败", str(exc))
+                self.info.path, self.tmp_base, self.level.get(),
+                output_format=self.force_format)
+            self.pending_suggestion = self.result.suggestion
+            self.pending_level = None
+        except compressor.NoGainError as exc:
+            # 压不小：不产出比原图更大的文件，改为如实告知，并把可行的出路摆出来
             self.result = None
+            self.pending_suggestion = exc.suggestion
+            self.pending_level = exc.suggested_level
+            messagebox.showwarning("压不小", str(exc))
+        except compressor.CompressError as exc:
+            self.result = None
+            self.pending_suggestion = None
+            self.pending_level = None
+            messagebox.showerror("压缩失败", str(exc))
         finally:
             self.root.config(cursor="")
 
@@ -219,12 +268,13 @@ class App:
 
     def do_save(self):
         """弹出保存对话框。真正的写入逻辑在 save_to 里，方便单独测试。"""
+        ext = compressor.EXTENSIONS[self.result.output_format]
         stem = os.path.splitext(self.info.file_name)[0]
         path = filedialog.asksaveasfilename(
             title="保存压缩后的图片",
-            defaultextension=".jpg",
-            initialfile=f"{stem}_compressed.jpg",
-            filetypes=[("JPEG 图片", "*.jpg")],
+            defaultextension=ext,
+            initialfile=f"{stem}_compressed{ext}",
+            filetypes=[(f"{FORMAT_LABELS[self.result.output_format]} 图片", f"*{ext}")],
         )
         if path:
             self.save_to(path)
@@ -256,24 +306,25 @@ class App:
     # ---------------- 界面状态刷新 ----------------
 
     def _show_result(self):
+        # 没有成功结果时，只保留「建议」按钮 —— 用户仍然可以从这里一键脱困
         if self.result is None:
-            self._clear_result()
+            self._clear_result(keep_suggestion=True)
             return
 
         r = self.result
         self.result_vars["before"].set(format_size(r.source.size_bytes))
         self.result_vars["after"].set(format_size(r.output_size_bytes))
+        self.result_vars["format"].set(FORMAT_LABELS.get(r.output_format, r.output_format))
 
         gain = 1 - r.ratio
         self.result_vars["saved"].set(f"{gain * 100:.1f}%")
 
         # 如实反馈：不把「省得不多」甚至「反而更大」包装成成功优化（requirement.md §5）
         if r.saved_bytes <= 0:
-            note = ("注意：压缩后反而变大了。这张图可能本来就压得很紧，"
-                    "或者内容不适合用 JPEG（例如截图、插画、带文字的图片）。")
+            note = "注意：压缩后反而变大了。这张图本来就压得很紧，或者不适合这个格式。"
             style = "Bad.TLabel"
         elif gain < LOW_GAIN_THRESHOLD:
-            note = "注意：节省很少（不到 10%）。这张图很可能已经压缩过了。"
+            note = "注意：节省不到 10%。这张图很可能已经压缩过了。"
             style = "Warn.TLabel"
         else:
             note = ""
@@ -285,12 +336,36 @@ class App:
         else:
             self.note_label.grid_remove()
 
-    def _clear_result(self):
+        self._update_suggestion_buttons()
+
+    def _update_suggestion_buttons(self):
+        if self.pending_suggestion:
+            name = FORMAT_LABELS.get(self.pending_suggestion.format,
+                                     self.pending_suggestion.format)
+            self.suggest_btn.configure(
+                text=f"改用 {name}（还能再小 {self.pending_suggestion.saved_ratio * 100:.0f}%）")
+            self.suggest_btn.grid()
+        elif self.pending_level:
+            names = dict((k, n) for k, n, _ in LEVEL_CHOICES)
+            self.suggest_btn.configure(
+                text=f"改用「{names.get(self.pending_level, self.pending_level)}」档重压")
+            self.suggest_btn.grid()
+        else:
+            self.suggest_btn.grid_remove()
+
+        # 已经转过格式了，给一个回到原格式的出口，免得用户走进死胡同
+        self.restore_btn.grid() if self.force_format else self.restore_btn.grid_remove()
+
+    def _clear_result(self, keep_suggestion=False):
         self.result = None
         for var in self.result_vars.values():
             var.set("—")
         self.note_label.configure(style="TLabel", text="")
         self.note_label.grid_remove()
+        if not keep_suggestion:
+            self.pending_suggestion = None
+            self.pending_level = None
+        self._update_suggestion_buttons()
 
     def _refresh_buttons(self):
         self.compress_btn.state(["!disabled"] if self.info else ["disabled"])
