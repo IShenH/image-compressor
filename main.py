@@ -6,6 +6,15 @@
 
 界面流程：
     选择图片 → 查看信息 → 设置压缩目标 → 压缩 → 查看结果 → 保存
+
+**关于布局**：窗口是固定尺寸（由屏幕工作区反推，保持设计稿 1.777 的比例），
+所以整页用一张**代码生成的背景图**打底（页面底色 + 卡片圆角 + 描边 + 分隔线 +
+所有**静态**文字），控件再按算好的坐标 `place()` 上去。这样做的理由：
+
+- 窗口尺寸固定 → 不需要动态布局，绝对定位反而最简单可靠
+- 静态文字交给背景图，能精确对齐图标与基线，也少二十来个控件
+- **但一行文字不会两边各画一半** —— tkinter 与 PIL 是两套文字渲染，
+  同一行里混用会看出差异。静态的整行归背景图，动态的整行归控件。
 """
 
 import os
@@ -14,21 +23,26 @@ import shutil
 import tempfile
 import threading
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox
+
+from PIL import ImageDraw
 
 import compressor
+import ui_draw
+import ui_theme as T
+import ui_widgets as W
 
 
 # 版本号。改这里的同时要更新 CHANGELOG.md
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 
-# 档位：压缩逻辑使用的键名 → 界面显示名称与说明。
-# 键名属于逻辑层（见 compressor.LEVELS），中文文案属于界面层，所以映射放在这里。
+# 档位：压缩逻辑使用的键名 → 界面显示名称、说明、图标。
+# 键名属于逻辑层（见 compressor.LEVELS），中文文案与图标属于界面层，所以映射放在这里。
 LEVEL_CHOICES = [
-    ("balanced", "均衡", "体积与画质兼顾"),
-    ("small", "小体积", "压得最狠，画质损失明显"),
-    ("high", "高画质", "尽量保住画质"),
+    ("balanced", "均衡", "体积与画质兼顾", "contrast"),
+    ("small", "小体积", "压缩最狠，画质损失明显", "compress"),
+    ("high", "高画质", "尽量保住画质", "sparkle"),
 ]
 DEFAULT_LEVEL = "balanced"
 
@@ -43,6 +57,16 @@ LOW_GAIN_THRESHOLD = 0.10
 # 界面照样卡死，那就等于白开了线程。
 POLL_INTERVAL_MS = 60
 
+# 拖放区接受的扩展名。拖进来的是不是图片，先按扩展名筛一道，
+# 免得把 .exe 之类的东西丢给 Pillow 去试。
+DROP_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
+
+# 「原图信息」和「压缩结果」的行定义（图标 + 静态标签）
+INFO_ROWS = [("file", "文件名："), ("tag", "格式："),
+             ("ruler", "尺寸："), ("disk", "文件大小：")]
+RESULT_LEFT_ROWS = [("image", "压缩前："), ("image", "压缩后："), ("bars", "减少：")]
+RESULT_RIGHT_ROWS = [("tag", "输出格式："), ("ruler", "输出尺寸：")]
+
 
 def enable_dpi_awareness():
     """让 Windows 不要对窗口做位图拉伸。
@@ -52,9 +76,13 @@ def enable_dpi_awareness():
     """
     try:
         import ctypes
-        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
     except Exception:
-        pass
+        try:
+            import ctypes
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
 
 
 def apply_tk_scaling(root):
@@ -62,6 +90,9 @@ def apply_tk_scaling(root):
 
     开启 DPI 感知之后，tkinter 仍然按 96 DPI 计算字号，在高缩放屏幕上字会偏小。
     换算关系：tk 的 scaling = 每一「点」占多少像素 = 屏幕 DPI ÷ 72。
+
+    注意：本项目的字号**全部用负值（像素）**，不受这个换算影响 ——
+    这里设置它是为了让 ttk 自带的部件（比如消息框）也跟着放大。
     """
     try:
         root.tk.call("tk", "scaling", root.winfo_fpixels("1i") / 72.0)
@@ -112,129 +143,575 @@ class App:
         # tkinter 不是线程安全的，跨线程操作控件会随机崩溃。
         self.queue = queue.Queue()
         self.busy = False
-        self.input_widgets = []  # 压缩期间需要一并禁用的控件
+        self.input_widgets = []   # 压缩期间需要一并禁用的控件
+
+        self.thumb = None         # 预览缩略图的 PhotoImage，必须留引用
+        self._show_pos = {}       # 控件 → 摆放参数（显隐时要用）
+        # 结果区里三个可选元素的显隐状态。它们影响卡片高度，所以要参与布局计算。
+        self._extra = {"note": False, "suggest": False, "restore": False}
+        self._layout_ver = 0      # 布局版本号：背景图缓存键要带上它
+        self._drop_ready = False  # 拖放只能挂一次窗口过程，不能重复挂
+        self.header_h = {}
+
+        self.win_w, self.win_h = T.init(root)
+        self.rects = self._compute_layout()
 
         self._build_ui()
         self._refresh_buttons()
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
+    # ---------------- 布局计算 ----------------
+
+    def _extra_height(self):
+        """结果卡片里三个可选元素占多高 —— 只算**当前显示的**。
+
+        如果无条件预留，「提示 / 建议按钮 / 恢复按钮」不显示时卡片底部会空一大块。
+        """
+        m = T.M
+        total = 0
+        if self._extra["note"]:
+            total += m.s(26) + m.s(8)
+        if self._extra["suggest"]:
+            total += m.s(40) + m.s(8)
+        if self._extra["restore"]:
+            total += m.s(34) + m.s(8)
+        return total
+
+    def _compute_layout(self):
+        """算出每个区块的位置和大小。
+
+        卡片高度由**内容**算出来（标题行 + 若干信息行 + 内边距），
+        剩余空间平均分给间距 —— 这样既不会挤，也不会出现「某块空一大半」。
+        屏幕太小时按比例压缩，宁可挤一点也不能让底部超出屏幕。
+        """
+        m = T.M
+        pad = m.page_pad
+        inner = self.win_w - 2 * pad
+
+        header = m.s(56)          # 区块标题行（图标 + 标题 + 分隔线）
+        row = m.s(46)             # 信息行高
+        hint = m.s(26)            # 灰提示行
+
+        heights = {
+            "drop": m.s(250),
+            "info": header + max(m.preview_h, len(INFO_ROWS) * row) + 2 * m.card_pad_y,
+            "level": header + m.card_h + hint + 2 * m.card_pad_y,
+            "size": header + m.btn_h_small + hint + 2 * m.card_pad_y,
+            # 压缩按钮下方留出进度条的位置（进度条平时藏着，但位置要占住，
+            # 否则一压缩下面的东西就整体往下跳）
+            "compress": m.btn_h + m.s(22),
+            # 高度随三个可选元素的显隐变化，不无条件预留（理由见 _extra_height）
+            "result": header + 3 * row + self._extra_height() + 2 * m.card_pad_y,
+            "save": m.btn_h,
+        }
+        order = ["drop", "info", "level", "size", "compress", "result", "save"]
+        gaps = len(order) - 1
+        min_gap = m.s(14)
+        available = self.win_h - 2 * pad
+
+        if sum(heights.values()) + gaps * min_gap > available:
+            scale = (available - gaps * min_gap) / float(sum(heights.values()))
+            heights = {k: max(m.s(40), int(v * scale)) for k, v in heights.items()}
+
+        slack = available - sum(heights.values())
+        gap = max(min_gap, slack // gaps)
+
+        rects, y = {}, pad
+        for key in order:
+            rects[key] = (pad, y, inner, heights[key])
+            y += heights[key] + gap
+        return rects
+
+    # ---------------- 摆放与显隐 ----------------
+
+    def _reg(self, widget, **kw):
+        """把控件摆上去，并**记下位置**。
+
+        为什么要记：`place()` 不带参数**不能**恢复摆放 —— 位置记着，但控件仍处于
+        「未放置」状态（这一点和 `grid()` 不一样，grid 无参可以恢复）。
+        所以显隐必须自己带着参数重新 place 一次。
+        """
+        self._show_pos[widget] = kw
+        widget.place(**kw)
+        return widget
+
+    def _show(self, widget):
+        widget.place(**self._show_pos[widget])
+
+    @staticmethod
+    def _hide(widget):
+        widget.place_forget()
+
     # ---------------- 界面搭建 ----------------
 
     def _build_ui(self):
+        m = T.M
         self.root.title(f"图片压缩工具 {__version__}")
+        self.root.configure(bg=T.PAGE_BG)
+        self.root.resizable(False, False)
+        # 定位要算上边框开销：geometry 设的是客户区，按客户区居中会整体偏右下
+        self.root.geometry(T.center_geometry(self.root, self.win_w, self.win_h))
+        try:
+            self.root.iconphoto(True, T.photo(ui_draw.app_icon(64), key="appicon"))
+        except Exception:
+            pass
 
-        style = ttk.Style()
-        style.configure("Warn.TLabel", foreground="#8a6d00")
-        style.configure("Bad.TLabel", foreground="#c0392b")
+        # 整页背景（含所有静态文字）画在一张 Canvas 上，控件再叠上去
+        self.bg = tk.Canvas(self.root, width=self.win_w, height=self.win_h,
+                            highlightthickness=0, bd=0, bg=T.PAGE_BG)
+        self.bg.place(x=0, y=0)
 
-        outer = ttk.Frame(self.root, padding=12)
-        outer.grid(row=0, column=0, sticky="nsew")
-        outer.columnconfigure(0, weight=1)
-        row = 0
+        self._create_widgets()
+        self._relayout()
+        self._enable_drop()
 
-        # ---- 选择图片 ----
-        self.choose_btn = ttk.Button(outer, text="选择图片…", command=self.choose_file)
-        self.choose_btn.grid(row=row, column=0, sticky="w")
-        self.input_widgets.append(self.choose_btn)
-        row += 1
+    def _draw_background(self):
+        """把所有静态内容画进一张图：底色、卡片、圆角、描边、分隔线、静态文字。"""
+        m = T.M
+        bg = ui_draw.rounded_rect((self.win_w, self.win_h), 0, fill=T.PAGE_BG)
 
-        # ---- 原图信息 ----
-        info_box = ttk.LabelFrame(outer, text="原图信息", padding=(10, 6, 10, 6))
-        info_box.grid(row=row, column=0, sticky="ew", pady=(12, 0))
-        self.info_vars = {}
-        for i, (key, title) in enumerate([
-                ("file_name", "文件名"), ("format", "格式"),
-                ("dimensions", "尺寸"), ("size_bytes", "文件大小")]):
-            ttk.Label(info_box, text=f"{title}：").grid(row=i, column=0, sticky="w", pady=1)
-            var = tk.StringVar(value="—")
-            ttk.Label(info_box, textvariable=var).grid(row=i, column=1, sticky="w", pady=1)
-            self.info_vars[key] = var
-        row += 1
+        # ---- 卡片底 ----
+        for key in ("info", "level", "size", "result"):
+            x, y, w, h = self.rects[key]
+            bg.alpha_composite(
+                ui_draw.rounded_rect((w, h), m.radius, fill=T.CARD_BG,
+                                     outline=T.BORDER, width=1), (x, y))
 
-        # ---- 压缩档位 ----
-        level_box = ttk.LabelFrame(outer, text="压缩档位", padding=(10, 6, 10, 6))
-        level_box.grid(row=row, column=0, sticky="ew", pady=(12, 0))
-        for i, (key, name, desc) in enumerate(LEVEL_CHOICES):
-            radio = ttk.Radiobutton(level_box, text=name, value=key, variable=self.level,
-                                    command=self._on_level_change)
-            radio.grid(row=i, column=0, sticky="w")
-            self.input_widgets.append(radio)
-            ttk.Label(level_box, text=desc).grid(row=i, column=1, sticky="w", padx=(12, 0))
-        # 文案要短：系统缩放 125%/150% 时字体会等比放大，长文案会折成难看的碎片
-        ttk.Label(level_box, foreground="#777",
-                  text="PNG 只能靠减色变小（有损）"
-                  ).grid(row=len(LEVEL_CHOICES), column=0, columnspan=2,
-                         sticky="w", pady=(6, 0))
-        row += 1
+        # ---- 拖放区（虚线框，表示可拖入）----
+        x, y, w, h = self.rects["drop"]
+        bg.alpha_composite(
+            ui_draw.dashed_round_rect((w, h), m.radius, color="#CFC8BE",
+                                      width=1, dash=6, gap=5), (x, y))
+        d = ImageDraw.Draw(bg)
+        d.text((x + w // 2, y + int(h * 0.24)), "选择图片或拖拽到这里",
+               font=T.pil_font(24, bold=True), fill=T.TEXT_STRONG, anchor="mm")
+        d.text((x + w // 2, y + int(h * 0.45)), "支持常见的图片格式（JPG、PNG、WEBP 等）",
+               font=T.pil_font(18), fill=T.TEXT_MUTED, anchor="mm")
+
+        # ---- 各卡片内的静态内容 ----
+        self.header_h["info"] = self._draw_header(bg, "info", "image", "原图信息")
+        self.header_h["level"] = self._draw_header(bg, "level", "sliders", "压缩档位")
+        self.header_h["size"] = self._draw_header(bg, "size", "expand", "输出尺寸")
+        self.header_h["result"] = self._draw_header(bg, "result", "bars", "压缩结果")
+
+        d = ImageDraw.Draw(bg)
+        self._draw_info_card(bg, d)
+        self._draw_level_hint(bg, d)
+        self._draw_size_card(bg, d)
+        self._draw_result_labels(bg, d)
+
+        # 整页一次性贴上去。重排时卡片高度会变，所以缓存键要带上布局版本号，
+        # 否则会拿到上一版尺寸的旧图。
+        self.bg.delete("all")
+        self.bg.create_image(0, 0, anchor="nw",
+                             image=T.photo(bg, key=("pagebg", self.win_w,
+                                                    self.win_h, self._layout_ver)))
+
+    def _draw_header(self, bg, key, icon, title):
+        """画区块标题（图标 + 标题 + 分隔线），返回正文起始 y。"""
+        m = T.M
+        x, y, w, h = self.rects[key]
+        ix = x + m.card_pad_x
+        top = y + m.card_pad_y
+        ico = m.s(30)
+        bg.alpha_composite(ui_draw.icon(icon, ico, T.TEXT, stroke=1.7), (ix, top))
+        ImageDraw.Draw(bg).text((ix + ico + m.s(10), top + ico // 2), title,
+                                font=T.pil_font(21, bold=True),
+                                fill=T.TEXT_STRONG, anchor="lm")
+        line_y = top + ico + m.s(12)
+        bg.alpha_composite(
+            ui_draw.hline((w - 2 * m.card_pad_x, 1), T.BORDER_SOFT), (ix, line_y))
+        return line_y + m.s(12)
+
+    def _draw_info_card(self, bg, d):
+        m = T.M
+        x, y, w, h = self.rects["info"]
+        ix = x + m.card_pad_x
+        top = self.header_h["info"]
+
+        # 预览框底（里头的缩略图是动态的，运行时再贴）
+        self.preview_box = (ix, top, m.preview_w, m.preview_h)
+        bg.alpha_composite(
+            ui_draw.rounded_rect((m.preview_w, m.preview_h), m.radius_small,
+                                 fill="#EDEAE4", outline=T.BORDER_SOFT, width=1),
+            (ix, top))
+        ph = ui_draw.icon("image", m.s(64), "#C6C0B7", stroke=1.4)
+        bg.alpha_composite(ph, (ix + (m.preview_w - ph.width) // 2,
+                                top + (m.preview_h - ph.height) // 2))
+
+        # 右侧四行：图标 + 静态标签
+        row = m.s(46)
+        label_x = ix + m.preview_w + m.s(26)
+        label_w = 0
+        for i, (icon, text) in enumerate(INFO_ROWS):
+            ry = top + i * row
+            ico = m.s(26)
+            bg.alpha_composite(ui_draw.icon(icon, ico, T.TEXT_MUTED, stroke=1.7),
+                               (label_x, ry + (row - ico) // 2))
+            d.text((label_x + ico + m.s(10), ry + row // 2), text,
+                   font=T.pil_font(19), fill=T.TEXT_MUTED, anchor="lm")
+            label_w = max(label_w,
+                          T.pil_font(19).getlength(text))
+        # 数值统一左对齐到同一列，行与行之间看起来才整齐
+        self.info_value_x = int(label_x + m.s(26) + m.s(10) + label_w + m.s(12))
+        self.info_row_y = top
+        self.info_row_h = row
+
+    def _draw_level_hint(self, bg, d):
+        m = T.M
+        x, y, w, h = self.rects["level"]
+        ix = x + m.card_pad_x
+        hy = self.header_h["level"] + m.card_h + m.s(12)
+        ico = m.s(24)
+        bg.alpha_composite(ui_draw.icon("info", ico, T.TEXT_MUTED, stroke=1.7),
+                           (ix, hy))
+        d.text((ix + ico + m.s(10), hy + ico // 2),
+               "PNG 没有质量参数，只能靠减色变小（有损）",
+               font=T.pil_font(18), fill=T.TEXT_MUTED, anchor="lm")
+
+    def _draw_size_card(self, bg, d):
+        m = T.M
+        x, y, w, h = self.rects["size"]
+        ix = x + m.card_pad_x
+        top = self.header_h["size"]
+        self.size_row_y = top
+        self.size_check_w = m.s(230)
+        self.size_field_x = ix + self.size_check_w + m.s(16)
+        self.size_field_w = m.s(150)
+        d.text((self.size_field_x + self.size_field_w + m.s(12),
+                top + m.btn_h_small // 2), "像素",
+               font=T.pil_font(19), fill=T.TEXT, anchor="lm")
+        d.text((ix, top + m.btn_h_small + m.s(12)),
+               "只缩小，不放大",
+               font=T.pil_font(18), fill=T.TEXT_MUTED, anchor="lt")
+
+    def _draw_result_labels(self, bg, d):
+        """结果区两列网格。左边三行、右边两行，静态标签画进背景，数值由控件填。"""
+        m = T.M
+        x, y, w, h = self.rects["result"]
+        ix = x + m.card_pad_x
+        top = self.header_h["result"]
+        row = m.s(46)
+        col_w = (w - 2 * m.card_pad_x - m.s(24)) // 2
+        self.result_row_y = top
+        self.result_row_h = row
+
+        self.result_value_x = {}
+        for i, (icon, text) in enumerate(RESULT_LEFT_ROWS):
+            ry = top + i * row
+            ico = m.s(26)
+            bg.alpha_composite(ui_draw.icon(icon, ico, T.TEXT_MUTED, stroke=1.7),
+                               (ix, ry + (row - ico) // 2))
+            d.text((ix + ico + m.s(10), ry + row // 2), text,
+                   font=T.pil_font(19), fill=T.TEXT_MUTED, anchor="lm")
+            key = ("before", "after", "saved")[i]
+            self.result_value_x[key] = int(ix + m.s(26) + m.s(10)
+                                           + T.pil_font(19).getlength(text) + m.s(12))
+
+        right_x = ix + col_w + m.s(24)
+        for i, (icon, text) in enumerate(RESULT_RIGHT_ROWS):
+            ry = top + i * row
+            ico = m.s(26)
+            bg.alpha_composite(ui_draw.icon(icon, ico, T.TEXT_MUTED, stroke=1.7),
+                               (right_x, ry + (row - ico) // 2))
+            d.text((right_x + ico + m.s(10), ry + row // 2), text,
+                   font=T.pil_font(19), fill=T.TEXT_MUTED, anchor="lm")
+            key = ("format", "dimensions")[i]
+            self.result_value_x[key] = int(right_x + m.s(26) + m.s(10)
+                                           + T.pil_font(19).getlength(text) + m.s(12))
+
+        self.result_note_y = top + 3 * row + m.s(6)
+        self.result_suggest_y = self.result_note_y + m.s(26) + m.s(6)
+        self.result_restore_y = self.result_suggest_y + m.s(40) + m.s(6)
+        self.card_inner_x = ix
+        self.card_inner_w = w - 2 * m.card_pad_x
+
+    def _relayout(self):
+        """重新算布局、重画背景、重新摆放控件。
+
+        什么时候需要：结果区里「提示行 / 建议按钮 / 恢复原格式按钮」的显隐变了。
+        它们不显示时整页必须收上去 —— 无条件预留位置会让卡片底部空一大块。
+        整页背景重画一次约 25ms，察觉不到。
+        """
+        self.rects = self._compute_layout()
+        self._layout_ver += 1
+        self._draw_background()
+        self._apply_positions()
+
+    def _create_widgets(self):
+        """建好全部控件。只建一次，位置交给 _apply_positions。"""
+        self.info_vars = {k: tk.StringVar(value="—") for k in
+                          ("file_name", "format", "dimensions", "size_bytes")}
+        self.result_vars = {k: tk.StringVar(value="—") for k in
+                            ("before", "after", "saved", "format", "dimensions")}
+
+        self.choose_btn = W.FlatButton(self.bg, text="选择图片…", icon="folder",
+                                       kind="primary", command=self.choose_file,
+                                       bg=T.PAGE_BG)
+        self.preview_label = tk.Label(self.bg, bg="#EDEAE4", bd=0,
+                                      highlightthickness=0)
+        self.info_labels = {}
+        for key in self.info_vars:
+            lbl = W.label(self.bg, size=19, color=T.TEXT)
+            lbl.configure(textvariable=self.info_vars[key], anchor="w")
+            self.info_labels[key] = lbl
+
+        self.level_cards = []
+        for key, name, desc, icon in LEVEL_CHOICES:
+            card = W.ChoiceCard(self.bg, name, desc, icon, key, self.level,
+                                command=self._on_level_change, bg=T.CARD_BG)
+            self.level_cards.append(card)
+            self.input_widgets.append(card)
+
+        self.size_check = W.FlatCheck(self.bg, text="限制最长边",
+                                      variable=self.limit_size,
+                                      command=self._on_size_change,
+                                      bg=T.CARD_BG)
+        self.input_widgets.append(self.size_check)
+
+        self.size_field = W.NumberField(self.bg, self.max_dimension, step=100,
+                                        minimum=64, maximum=20000,
+                                        command=self._on_size_change,
+                                        bg=T.CARD_BG)
+        # 手动输入不会触发 command，得单独监听按键，否则结果会停留在旧尺寸上
+        self.size_field.entry.bind("<KeyRelease>", lambda _e: self._on_size_change())
+        # 测试与旧代码都按 size_spin 这个名字找它
+        self.size_spin = self.size_field
+        self.input_widgets.append(self.size_field)
+
+        self.compress_btn = W.FlatButton(self.bg, text="压缩", icon="sparkle",
+                                         kind="primary", command=self.do_compress)
+        self.progress = W.ThinProgress(self.bg, bg=T.PAGE_BG)
+
+        self.result_labels = {}
+        for key in self.result_vars:
+            lbl = W.label(self.bg, size=19, color=T.TEXT)
+            lbl.configure(textvariable=self.result_vars[key], anchor="w")
+            self.result_labels[key] = lbl
+
+        self.note_label = W.label(self.bg, size=18, color=T.WARN)
+        self.suggest_btn = W.FlatButton(self.bg, text="", icon=None,
+                                        kind="secondary",
+                                        command=self.apply_suggestion, bg=T.CARD_BG)
+        self.restore_btn = W.FlatButton(self.bg, text="恢复原格式", icon=None,
+                                        kind="secondary",
+                                        command=self.restore_format, bg=T.CARD_BG)
+        self.save_btn = W.FlatButton(self.bg, text="保存压缩后的图片…",
+                                     icon="download", kind="secondary",
+                                     command=self.do_save)
+
+    def _apply_positions(self):
+        """按最新算出的坐标摆放全部控件，并同步与布局相关的尺寸。"""
+        m = T.M
+
+        # ---- 拖放区 ----
+        x, y, w, h = self.rects["drop"]
+        bw = m.s(250)
+        self.choose_btn.configure(width=bw, height=m.s(78))
+        self._reg(self.choose_btn, x=x + (w - bw) // 2, y=y + int(h * 0.56))
+
+        # ---- 原图信息：预览框 + 四个数值 ----
+        bx, by, pw, ph = self.preview_box
+        self._reg(self.preview_label, x=bx, y=by, width=pw, height=ph)
+        for i, key in enumerate(self.info_vars):
+            self._reg(self.info_labels[key], x=self.info_value_x,
+                      y=self.info_row_y + i * self.info_row_h,
+                      width=m.s(400), height=self.info_row_h)
+
+        # ---- 压缩档位：三张卡片 ----
+        x, y, w, h = self.rects["level"]
+        gap = m.s(18)
+        card_w = (w - 2 * m.card_pad_x - 2 * gap) // 3
+        for i, card in enumerate(self.level_cards):
+            card.configure(width=card_w, height=m.card_h)
+            self._reg(card, x=x + m.card_pad_x + i * (card_w + gap),
+                      y=self.header_h["level"])
 
         # ---- 输出尺寸 ----
-        size_box = ttk.LabelFrame(outer, text="输出尺寸", padding=(10, 6, 10, 6))
-        size_box.grid(row=row, column=0, sticky="ew", pady=(8, 0))
-        self.size_check = ttk.Checkbutton(size_box, text="限制最长边",
-                                          variable=self.limit_size,
-                                          command=self._on_size_change)
-        self.size_check.grid(row=0, column=0, sticky="w")
-        self.input_widgets.append(self.size_check)
-        self.size_spin = ttk.Spinbox(size_box, from_=64, to=20000, increment=100,
-                                     width=7, textvariable=self.max_dimension,
-                                     command=self._on_size_change)
-        self.size_spin.grid(row=0, column=1, sticky="w", padx=(8, 4))
-        self.input_widgets.append(self.size_spin)
-        # 手动输入不会触发 command，得单独监听按键，否则结果会停留在旧尺寸上
-        self.size_spin.bind("<KeyRelease>", lambda _e: self._on_size_change())
-        ttk.Label(size_box, text="像素").grid(row=0, column=2, sticky="w")
-        ttk.Label(size_box, foreground="#777", text="只缩小，不放大"
-                  ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(4, 0))
-        row += 1
+        x, y, w, h = self.rects["size"]
+        self.size_check.configure(width=self.size_check_w, height=m.btn_h_small)
+        self._reg(self.size_check, x=x + m.card_pad_x, y=self.size_row_y)
+        self.size_field.configure(width=self.size_field_w, height=m.btn_h_small)
+        self._reg(self.size_field, x=self.size_field_x, y=self.size_row_y)
 
-        # ---- 执行压缩 ----
-        self.compress_btn = ttk.Button(outer, text="压缩", command=self.do_compress)
-        self.compress_btn.grid(row=row, column=0, sticky="ew", pady=(8, 0))
-        row += 1
-
-        # 进度条只在压缩期间出现，空闲时收起来，不占地方
-        self.progress = ttk.Progressbar(outer, mode="indeterminate")
-        self.progress.grid(row=row, column=0, sticky="ew", pady=(6, 0))
-        self.progress.grid_remove()
-        row += 1
+        # ---- 压缩按钮 + 进度条 ----
+        x, y, w, h = self.rects["compress"]
+        self.compress_btn.configure(width=w, height=m.btn_h)
+        self._reg(self.compress_btn, x=x, y=y)
+        pw = int(w * 0.55)
+        self.progress.configure(width=pw, height=m.s(12))
+        self._reg(self.progress, x=x + (w - pw) // 2, y=y + m.btn_h + m.s(5))
 
         # ---- 压缩结果 ----
-        result_box = ttk.LabelFrame(outer, text="压缩结果", padding=(10, 6, 10, 6))
-        result_box.grid(row=row, column=0, sticky="ew", pady=(8, 0))
-        # 只有数值列（第 1 列）吸收多余宽度。
-        # 不给第 0 列权重，否则标签列会撑开、把数值挤到窗口最右边甚至裁掉。
-        result_box.columnconfigure(1, weight=1)
-        self.result_vars = {}
-        for i, (key, title) in enumerate([
-                ("before", "压缩前"), ("after", "压缩后"),
-                ("saved", "减少"), ("format", "输出格式"),
-                ("dimensions", "输出尺寸")]):
-            ttk.Label(result_box, text=f"{title}：").grid(row=i, column=0, sticky="w", pady=1)
-            var = tk.StringVar(value="—")
-            ttk.Label(result_box, textvariable=var).grid(row=i, column=1, sticky="w", pady=1)
-            self.result_vars[key] = var
+        row_index = {"before": 0, "after": 1, "saved": 2,
+                     "format": 0, "dimensions": 1}
+        for key, lbl in self.result_labels.items():
+            self._reg(lbl, x=self.result_value_x[key],
+                      y=self.result_row_y + row_index[key] * self.result_row_h,
+                      width=m.s(300), height=self.result_row_h)
 
-        last = len(self.result_vars)
-        self.note_label = ttk.Label(result_box, text="", wraplength=300, justify="left")
-        self.note_label.grid(row=last, column=0, columnspan=2, sticky="w", pady=(6, 0))
-        self.note_label.grid_remove()
+        self._reg(self.note_label, x=self.card_inner_x, y=self.result_note_y,
+                  width=self.card_inner_w, height=m.s(26))
+        self.suggest_btn.configure(width=self.card_inner_w, height=m.s(40))
+        self._reg(self.suggest_btn, x=self.card_inner_x, y=self.result_suggest_y)
+        self.restore_btn.configure(width=self.card_inner_w, height=m.s(34))
+        self._reg(self.restore_btn, x=self.card_inner_x, y=self.result_restore_y)
 
-        # 建议按钮：只有在「换个做法能压得更小」时才出现。
-        # 是否换格式由用户点它决定 —— 程序不擅自替他改格式。
-        self.suggest_btn = ttk.Button(result_box, text="", command=self.apply_suggestion)
-        self.suggest_btn.grid(row=last + 1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
-        self.suggest_btn.grid_remove()
+        # ---- 保存按钮 ----
+        x, y, w, h = self.rects["save"]
+        self.save_btn.configure(width=w, height=m.btn_h)
+        self._reg(self.save_btn, x=x, y=y)
 
-        self.restore_btn = ttk.Button(result_box, text="恢复原格式",
-                                      command=self.restore_format)
-        self.restore_btn.grid(row=last + 2, column=0, columnspan=2, sticky="ew", pady=(4, 0))
-        self.restore_btn.grid_remove()
-        row += 1
+        # ---- 按当前状态决定谁可见 ----
+        self._visibility()
 
-        # ---- 保存 ----
-        self.save_btn = ttk.Button(outer, text="保存压缩后的图片…", command=self.do_save)
-        self.save_btn.grid(row=row, column=0, sticky="ew", pady=(8, 0))
+    def _visibility(self):
+        """按「有没有图 / 是否在压缩 / 三个可选元素的状态」统一刷一遍显隐。"""
+        pairs = [
+            (self.preview_label, bool(self.thumb)),
+            (self.progress, self.busy),
+            (self.note_label, self._extra["note"]),
+            (self.suggest_btn, self._extra["suggest"]),
+            (self.restore_btn, self._extra["restore"]),
+        ]
+        for widget, visible in pairs:
+            if visible:
+                self._show(widget)
+            else:
+                self._hide(widget)
+
+    def _sync_extra(self, note=None, suggest=None, restore=None):
+        """更新三个可选元素的显隐；只要变了就整页重排一次。
+
+        不这么做的话，卡片要么空一大块、要么一显示按钮下面的东西就整体往下跳。
+        """
+        want = dict(self._extra)
+        if note is not None:
+            want["note"] = bool(note)
+        if suggest is not None:
+            want["suggest"] = bool(suggest)
+        if restore is not None:
+            want["restore"] = bool(restore)
+        if want != self._extra:
+            self._extra = want
+            self._relayout()
+
+    def _enable_drop(self):
+        """打开窗口的「接受文件拖放」标志。
+
+        tkinter 本身不支持文件拖放，但 Windows 只要给窗口加上 WS_EX_ACCEPTFILES
+        样式、再调一次 DragAcceptFiles，系统就会把拖进来的文件以
+        WM_DROPFILES 消息的形式告诉窗口。tkinter 收不到这个消息，
+        所以这里用 ctypes 自己挂一个窗口过程来处理它 —— 好处是**零新依赖**。
+        """
+        if self._drop_ready:
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            GWL_EXSTYLE, WS_EX_ACCEPTFILES, WM_DROPFILES = -20, 0x00000100, 0x0233
+            u32, shell = ctypes.windll.user32, ctypes.windll.shell32
+            self.root.update_idletasks()
+            hwnd = u32.GetAncestor(self.root.winfo_id(), 2)      # GA_ROOT
+
+            ex = u32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            u32.SetWindowLongW(hwnd, GWL_EXSTYLE, ex | WS_EX_ACCEPTFILES)
+            shell.DragAcceptFiles(hwnd, True)
+
+            WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_long, wintypes.HWND,
+                                         ctypes.c_uint, wintypes.WPARAM,
+                                         wintypes.LPARAM)
+            self._drag_files = []
+
+            def handler(h, msg, wp, lp):
+                if msg == WM_DROPFILES:
+                    count = shell.DragQueryFileW(wp, 0xFFFFFFFF, None, 0)
+                    for i in range(count):
+                        need = shell.DragQueryFileW(wp, i, None, 0) + 1
+                        buf = ctypes.create_unicode_buffer(need)
+                        shell.DragQueryFileW(wp, i, buf, need)
+                        self._drag_files.append(buf.value)
+                    shell.DragFinish(wp)
+                    # 不能在窗口过程里直接动界面（会重入），交给事件循环下一轮
+                    self.root.after(0, self._on_drop)
+                    return 0
+                return u32.CallWindowProcW(old_proc.value, h, msg, wp, lp)
+
+            self._wndproc = WNDPROC(handler)
+            old_proc = wintypes.WPARAM(u32.SetWindowLongPtrW(
+                hwnd, -4, ctypes.cast(self._wndproc, ctypes.c_void_p).value))
+            self._old_proc = old_proc
+            self._drop_hwnd = hwnd
+        except Exception:
+            # 拖放是附加能力，拿不到也不该影响主流程
+            self._wndproc = None
+        self._drop_ready = True
+
+    def _on_drop(self):
+        """处理拖进来的文件。只收单张图片，其余情况明确告知。"""
+        files, self._drag_files = self._drag_files, []
+        if not files:
+            return
+
+        images = [f for f in files if os.path.splitext(f)[1].lower() in DROP_EXTENSIONS]
+        folders = [f for f in files if os.path.isdir(f)]
+
+        if len(files) > 1 and not folders:
+            if not images:
+                messagebox.showwarning(
+                    "这些文件不是图片",
+                    "拖进来的文件里没有能处理的图片。\n"
+                    "支持 JPG、PNG、WebP、BMP、GIF、TIFF。")
+                return
+            if len(images) > 1:
+                messagebox.showinfo(
+                    "一次只能处理一张",
+                    f"拖进来了 {len(images)} 张图片，这里先处理第一张：\n"
+                    f"{os.path.basename(images[0])}")
+            self.load_file(images[0])
+            return
+
+        if folders:
+            messagebox.showwarning(
+                "不支持拖入文件夹",
+                "请把具体的图片文件拖进来，暂不支持整个文件夹。")
+            return
+
+        if not images:
+            messagebox.showwarning(
+                "这个文件不是图片",
+                f"「{os.path.basename(files[0])}」不是能处理的图片格式。\n"
+                "支持 JPG、PNG、WebP、BMP、GIF、TIFF。")
+            return
+
+        self.load_file(images[0])
+
+    # ---------------- 预览 ----------------
+
+    def _show_preview(self, path):
+        """在原图信息左侧显示缩略图。
+
+        两个必须注意的点：
+        1. 先 thumbnail 再转 PhotoImage，大图直接塞进控件会吃掉几百兆内存
+        2. PhotoImage 必须留引用，否则被垃圾回收后界面显示成一片空白
+        """
+        m = T.M
+        try:
+            from PIL import Image
+            with Image.open(path) as img:
+                img = img.convert("RGBA")
+                box = (self.preview_box[2] - m.s(8), self.preview_box[3] - m.s(8))
+                img.thumbnail(box, Image.LANCZOS)
+                from PIL import ImageTk
+                self.thumb = ImageTk.PhotoImage(img)
+        except Exception:
+            self.thumb = None
+            self._visibility()
+            return
+        self.preview_label.configure(image=self.thumb)
+        self._visibility()
 
     # ---------------- 事件处理 ----------------
 
@@ -260,6 +737,7 @@ class App:
         self.info_vars["format"].set(self.info.format)
         self.info_vars["dimensions"].set(f"{self.info.width} × {self.info.height}")
         self.info_vars["size_bytes"].set(format_size(self.info.size_bytes))
+        self._show_preview(path)
 
         # 换了图片，上一次的结果和用户之前要求的格式都作废
         self._reset_format_choice()
@@ -367,13 +845,12 @@ class App:
         if busy:
             self.root.config(cursor="watch")
             self.compress_btn.configure(text="正在压缩…")
-            self.progress.grid()
-            self.progress.start(12)
+            self.progress.start()
         else:
             self.root.config(cursor="")
             self.compress_btn.configure(text="压缩")
             self.progress.stop()
-            self.progress.grid_remove()
+        self._visibility()
         self._refresh_buttons()
 
     def do_save(self):
@@ -445,49 +922,44 @@ class App:
         # 如实反馈：不把「省得不多」甚至「反而更大」包装成成功优化
         if r.saved_bytes <= 0:
             note = "注意：压缩后反而变大了。这张图本来就压得很紧，或者不适合这个格式。"
-            style = "Bad.TLabel"
+            color = T.BAD
         elif gain < LOW_GAIN_THRESHOLD:
             note = "注意：节省不到 10%。这张图很可能已经压缩过了。"
-            style = "Warn.TLabel"
+            color = T.WARN
         else:
             note = ""
-            style = "TLabel"
+            color = T.TEXT
 
-        self.note_label.configure(text=note, style=style)
-        if note:
-            self.note_label.grid()
-        else:
-            self.note_label.grid_remove()
-
+        self.note_label.configure(text=note, fg=color)
+        self._sync_extra(note=bool(note))
         self._update_suggestion_buttons()
 
     def _update_suggestion_buttons(self):
+        show = False
         if self.pending_suggestion:
             name = FORMAT_LABELS.get(self.pending_suggestion.format,
                                      self.pending_suggestion.format)
             self.suggest_btn.configure(
                 text=f"改用 {name}（还能再小 {self.pending_suggestion.saved_ratio * 100:.0f}%）")
-            self.suggest_btn.grid()
+            show = True
         elif self.pending_level:
-            names = dict((k, n) for k, n, _ in LEVEL_CHOICES)
+            names = dict((k, n) for k, n, _, _ in LEVEL_CHOICES)
             self.suggest_btn.configure(
                 text=f"改用「{names.get(self.pending_level, self.pending_level)}」档重压")
-            self.suggest_btn.grid()
-        else:
-            self.suggest_btn.grid_remove()
+            show = True
 
         # 已经转过格式了，给一个回到原格式的出口，免得用户走进死胡同
-        self.restore_btn.grid() if self.force_format else self.restore_btn.grid_remove()
+        self._sync_extra(suggest=show, restore=bool(self.force_format))
 
     def _clear_result(self, keep_suggestion=False):
         self.result = None
         for var in self.result_vars.values():
             var.set("—")
-        self.note_label.configure(style="TLabel", text="")
-        self.note_label.grid_remove()
+        self.note_label.configure(text="", fg=T.WARN)
         if not keep_suggestion:
             self.pending_suggestion = None
             self.pending_level = None
+        self._sync_extra(note=False)
         self._update_suggestion_buttons()
 
     def _refresh_buttons(self):
@@ -495,6 +967,7 @@ class App:
             ["!disabled"] if (self.info and not self.busy) else ["disabled"])
         self.save_btn.state(
             ["!disabled"] if (self.result and not self.busy) else ["disabled"])
+        self.choose_btn.state(["disabled"] if self.busy else ["!disabled"])
         # 压缩期间不许改设置 —— 否则界面显示的选择，和正在后台跑的那个任务会对不上
         for widget in self.input_widgets:
             widget.state(["disabled"] if self.busy else ["!disabled"])
