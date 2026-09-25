@@ -156,13 +156,31 @@ def _has_alpha(img) -> bool:
     return False
 
 
+def _explain(exc: Exception) -> str:
+    """把 Pillow 的底层异常翻译成用户能看懂的一句话。
+
+    直接把原始英文异常抛给用户没有意义 —— 他既看不懂，也不知道该做什么。
+    """
+    text = str(exc)
+    if "truncated" in text:
+        return "图片数据不完整，可能在下载或复制过程中被截断了"
+    if "cannot identify" in text:
+        return "它的内容不是程序能识别的图片格式"
+    if "permission" in text.lower():
+        return "没有权限读取这个文件"
+    return text
+
+
 def read_info(path: str) -> ImageInfo:
     """读取一张图片的基本信息。
 
     有一个地方容易误解：`Image.open()` 是**惰性**的 —— 它只读文件头，
     拿到格式、尺寸这些信息就返回，并不真正解码像素。
-    所以这里读尺寸很快，而且「文件大小」必须从磁盘上取（os.path.getsize），
-    不能从图像对象上取 —— 磁盘上是压缩过的字节，内存里是解码后的像素，两者不是一回事。
+    所以「文件头正常但数据被截断」的图，在 `open()` 这一步是不会报错的。
+
+    因此这里**故意多解码一次**（实测 3840×2400 约 58 ms）：
+    换来的好处是用户刚选完图就知道文件坏了，而不是等配置完、点了「压缩」才失败。
+    顺带说明：`verify()` 虽然更便宜，但实测它对截断文件完全没有检出能力，用不得。
     """
     if not os.path.isfile(path):
         raise CompressError(f"文件不存在：{path}")
@@ -173,8 +191,9 @@ def read_info(path: str) -> ImageInfo:
             width, height = img.size
             mode = img.mode
             alpha = _has_alpha(img)
+            img.load()  # 真正解码，见上面的说明
     except Exception as exc:
-        raise CompressError(f"无法识别这个文件为图片：{exc}") from exc
+        raise CompressError(f"这个文件没法作为图片读取：{_explain(exc)}") from exc
 
     return ImageInfo(
         path=path,
@@ -393,82 +412,96 @@ def compress(src: str, dst: str, level: str = "balanced", output_format=None,
 
     target = _pick_target_format(info, output_format)
 
-    with Image.open(src) as img:
-        img.load()  # 先解码一次，后面要反复编码，避免每次都重新解
+    try:
+        with Image.open(src) as img:
+            # 先解码一次。后面要在同一张图上反复编码各个候选方案，
+            # 不先解好，每个候选都得重新解码一遍。
+            img.load()
+            return _compress_decoded(img, info, dst, target, level, max_dimension)
+    except CompressError:
+        raise  # 已经是能解释给用户的错误，原样抛出
+    except Exception as exc:
+        # 兜底：绝不让原始堆栈露到用户面前。哪怕是个没预料到的异常，
+        # 也要变成一句能读懂的话 —— 否则界面只能弹一个没人看得懂的英文报错。
+        raise CompressError(f"处理这张图片时出错：{_explain(exc)}") from exc
 
-        # 尺寸调整放在所有编码之前 —— 这样每个候选方案都在同一张「最终尺寸」的图上比较，
-        # 而且缩小尺寸能同时降低后续所有编码的耗时。
-        img = _downscale(img, max_dimension)
-        out_width, out_height = img.size
 
-        data, quantized = _best_in_format(img, info, target, level)
-        if data is None:
-            raise CompressError(f"这张图片无法保存成 {target} 格式。")
+def _compress_decoded(img, info: ImageInfo, dst: str, target: str,
+                      level: str, max_dimension) -> CompressResult:
+    """候选方案比较与落盘。传进来的 img 必须已经解码完成。"""
+    # 尺寸调整放在所有编码之前 —— 这样每个候选方案都在同一张「最终尺寸」的图上比较，
+    # 而且缩小尺寸能同时降低后续所有编码的耗时。
+    img = _downscale(img, max_dimension)
+    out_width, out_height = img.size
 
-        # ---- 尝试替代格式：既用于「压不动时的兜底」，也用于生成建议 ----
-        suggestion = None
-        alts = _alternatives_for(info, target)
-        # 保格式已经省下很多时就不再多花时间算替代方案（WebP 编码很慢）。
-        # 但如果这次用的是有损手段（PNG 减色），用户可能更愿意换格式而不是丢颜色，所以照算。
-        worth_checking = (1 - len(data) / info.size_bytes) < SKIP_SUGGESTION_ABOVE or quantized
-        if alts and worth_checking:
-            for alt in alts:
-                ad, _ = _best_in_format(img, info, alt, level)
-                if ad is None:
-                    continue
-                if suggestion is None or len(ad) < suggestion.size_bytes:
-                    suggestion = Suggestion(
-                        format=alt,
-                        size_bytes=len(ad),
-                        saved_ratio=1 - len(ad) / len(data),
-                    )
+    data, quantized = _best_in_format(img, info, target, level)
+    if data is None:
+        raise CompressError(f"这张图片无法保存成 {target} 格式。")
 
-            # 只有「明显更小」才值得打扰用户
-            if suggestion is not None and suggestion.saved_ratio < SUGGESTION_MIN_GAIN:
-                suggestion = None
-
-        # ---- 压不小就不产出（避免给用户一个更大的文件）----
-        if len(data) >= info.size_bytes:
-            if suggestion is not None and suggestion.size_bytes < info.size_bytes:
-                raise NoGainError(
-                    f"保持 {target} 格式压不小（原图 {info.size_bytes} 字节）。"
-                    f"换成 {suggestion.format} 可以压到 {suggestion.size_bytes} 字节。",
-                    suggestion=suggestion,
+    # ---- 尝试替代格式：既用于「压不动时的兜底」，也用于生成建议 ----
+    suggestion = None
+    alts = _alternatives_for(info, target)
+    # 保格式已经省下很多时就不再多花时间算替代方案（WebP 编码很慢）。
+    # 但如果这次用的是有损手段（PNG 减色），用户可能更愿意换格式而不是丢颜色，所以照算。
+    worth_checking = (1 - len(data) / info.size_bytes) < SKIP_SUGGESTION_ABOVE or quantized
+    if alts and worth_checking:
+        for alt in alts:
+            ad, _ = _best_in_format(img, info, alt, level)
+            if ad is None:
+                continue
+            if suggestion is None or len(ad) < suggestion.size_bytes:
+                suggestion = Suggestion(
+                    format=alt,
+                    size_bytes=len(ad),
+                    saved_ratio=1 - len(ad) / len(data),
                 )
 
-            # 换格式也没用，那看看是不是档位选得太保守 ——
-            # 有损编码很便宜（JPEG 约 6~130ms），多试两档的成本可以忽略。
-            # 不实测就说「试试更激进的档位」是不负责任的猜测，所以这里真的去试。
-            if target in ("JPEG", "WEBP"):
-                for other in LEVELS:
-                    if other == level:
-                        continue
-                    d2, _ = _best_in_format(img, info, target, other)
-                    if d2 is not None and len(d2) < info.size_bytes:
-                        raise NoGainError(
-                            f"这张图在「{level}」档位下压不小，"
-                            f"但换成「{other}」档可以压到 {len(d2)} 字节。",
-                            suggested_level=other,
-                        )
+        # 只有「明显更小」才值得打扰用户
+        if suggestion is not None and suggestion.saved_ratio < SUGGESTION_MIN_GAIN:
+            suggestion = None
 
+    # ---- 压不小就不产出（避免给用户一个更大的文件）----
+    if len(data) >= info.size_bytes:
+        if suggestion is not None and suggestion.size_bytes < info.size_bytes:
             raise NoGainError(
-                f"这张图在「{level}」档位下压不小 —— 它很可能已经被压得很紧了，"
-                "继续压缩不会让文件更小。"
+                f"保持 {target} 格式压不小（原图 {info.size_bytes} 字节）。"
+                f"换成 {suggestion.format} 可以压到 {suggestion.size_bytes} 字节。",
+                suggestion=suggestion,
             )
 
-        # ---- 落盘 ----
-        # 输出格式可能和 dst 的扩展名对不上（例如转成 WebP 却给了 .jpg），
-        # 这里把扩展名修正过来，并把真正写出的路径回传给调用方。
-        dst = os.path.splitext(dst)[0] + EXTENSIONS[target]
-        dst_dir = os.path.dirname(os.path.abspath(dst))
-        if not os.path.isdir(dst_dir):
-            raise CompressError(f"保存位置不存在：{dst_dir}")
+        # 换格式也没用，那看看是不是档位选得太保守 ——
+        # 有损编码很便宜（JPEG 约 6~130ms），多试两档的成本可以忽略。
+        # 不实测就说「试试更激进的档位」是不负责任的猜测，所以这里真的去试。
+        if target in ("JPEG", "WEBP"):
+            for other in LEVELS:
+                if other == level:
+                    continue
+                d2, _ = _best_in_format(img, info, target, other)
+                if d2 is not None and len(d2) < info.size_bytes:
+                    raise NoGainError(
+                        f"这张图在「{level}」档位下压不小，"
+                        f"但换成「{other}」档可以压到 {len(d2)} 字节。",
+                        suggested_level=other,
+                    )
 
-        try:
-            with open(dst, "wb") as fh:
-                fh.write(data)
-        except OSError as exc:
-            raise CompressError(f"写入失败：{exc}") from exc
+        raise NoGainError(
+            f"这张图在「{level}」档位下压不小 —— 它很可能已经被压得很紧了，"
+            "继续压缩不会让文件更小。"
+        )
+
+    # ---- 落盘 ----
+    # 输出格式可能和 dst 的扩展名对不上（例如转成 WebP 却给了 .jpg），
+    # 这里把扩展名修正过来，并把真正写出的路径回传给调用方。
+    dst = os.path.splitext(dst)[0] + EXTENSIONS[target]
+    dst_dir = os.path.dirname(os.path.abspath(dst))
+    if not os.path.isdir(dst_dir):
+        raise CompressError(f"保存位置不存在：{dst_dir}")
+
+    try:
+        with open(dst, "wb") as fh:
+            fh.write(data)
+    except OSError as exc:
+        raise CompressError(f"写入失败：{_explain(exc)}") from exc
 
     return CompressResult(
         source=info,
