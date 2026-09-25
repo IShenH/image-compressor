@@ -351,5 +351,52 @@ class GuiTest(unittest.TestCase):
         self.pump()
 
 
+    # ---------------- 布局不变量 ----------------
+
+    def test_layout_never_overflows_or_overlaps(self):
+        """任何「可选元素显隐」组合下：可见控件都不能超出窗口，互相也不能重叠。
+
+        这条是**补出来的**。之前只断言 winfo_ismapped()，看不出位置问题 ——
+        结果「提示行隐藏、但建议按钮显示」时，下面两个按钮的位置仍按
+        「三个都显示」往后排，偏出卡片高度，把保存按钮压住了。
+        """
+        cases = [
+            {"note": False, "suggest": False, "restore": False},
+            {"note": True, "suggest": False, "restore": False},
+            {"note": False, "suggest": True, "restore": False},
+            {"note": False, "suggest": False, "restore": True},
+            {"note": False, "suggest": True, "restore": True},
+            {"note": True, "suggest": True, "restore": True},
+        ]
+        widgets = [
+            ("压缩按钮", "compress_btn"), ("提示行", "note_label"),
+            ("建议按钮", "suggest_btn"), ("恢复按钮", "restore_btn"),
+            ("保存按钮", "save_btn"),
+        ]
+        for case in cases:
+            with self.subTest(extra=case):
+                self.app._extra = dict(case)
+                self.app._relayout()
+                self.pump()
+
+                boxes = []
+                for title, attr in widgets:
+                    widget = getattr(self.app, attr)
+                    if widget.winfo_ismapped():
+                        top = widget.winfo_y()
+                        boxes.append((title, top, top + widget.winfo_height()))
+
+                for title, _, bottom in boxes:
+                    self.assertLessEqual(
+                        bottom, self.app.win_h,
+                        "%s 底部 %d 超出窗口高度 %d" % (title, bottom, self.app.win_h))
+
+                boxes.sort(key=lambda box: box[1])
+                for (n1, _, b1), (n2, t2, _) in zip(boxes, boxes[1:]):
+                    self.assertLessEqual(
+                        b1, t2 + 1,
+                        "「%s」底部 %d 与「%s」顶部 %d 重叠" % (n1, b1, n2, t2))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
