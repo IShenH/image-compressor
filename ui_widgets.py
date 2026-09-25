@@ -182,9 +182,10 @@ class ChoiceCard(Control):
     """压缩档位卡片：整块可点，选中时换底色与边框色，左侧有单选圆点。"""
 
     def __init__(self, master, name, desc, icon, value, variable,
-                 command=None, width=170, height=None, **kw):
+                 command=None, width=170, height=None, bg=None, **kw):
         h = T.M.card_h if height is None else height
-        super().__init__(master, width=width, height=h, bg=T.CARD_BG, **kw)
+        super().__init__(master, width=width, height=h,
+                         bg=bg if bg is not None else T.CARD_BG, **kw)
         self._name = name
         self._desc = desc
         self._icon = icon
@@ -272,9 +273,10 @@ class FlatCheck(Control):
     """自绘复选框：圆角方框 + 对勾 + 右侧文字。"""
 
     def __init__(self, master, text="", variable=None, command=None,
-                 width=200, height=None, **kw):
+                 width=200, height=None, bg=None, **kw):
         h = T.M.s(46) if height is None else height
-        super().__init__(master, width=width, height=h, bg=T.CARD_BG, **kw)
+        super().__init__(master, width=width, height=h,
+                         bg=bg if bg is not None else T.CARD_BG, **kw)
         self._text = text
         self._var = variable if variable is not None else tk.BooleanVar(False)
         self._command = command
@@ -338,9 +340,10 @@ class NumberField(Control):
     """
 
     def __init__(self, master, variable, width=110, height=None, step=100,
-                 minimum=64, maximum=20000, command=None, **kw):
+                 minimum=64, maximum=20000, command=None, bg=None, **kw):
         h = T.M.btn_h_small if height is None else height
-        super().__init__(master, width=width, height=h, bg=T.CARD_BG, **kw)
+        super().__init__(master, width=width, height=h,
+                         bg=bg if bg is not None else T.CARD_BG, **kw)
         self._var = variable
         self.step = step
         self.minimum = minimum
@@ -402,6 +405,58 @@ class NumberField(Control):
 
 
 # ---------------------------------------------------------------- 小工具
+
+class ThinProgress(Control):
+    """细进度条（不确定进度，来回滑动）。
+
+    设计稿里没有它 —— 这是 M4 为「后台线程正在干活」加的状态反馈，不能因为改版丢掉。
+    用自绘而不用 ttk.Progressbar，是为了颜色和圆角跟整页一致。
+    """
+
+    def __init__(self, master, width=200, height=None, bg=None, **kw):
+        h = T.M.s(12) if height is None else height
+        super().__init__(master, width=width, height=h, bg=bg, **kw)
+        self._pos = 0.0
+        self._job = None
+        self.finish_init()
+
+    def start(self, interval=14):
+        if self._job is None:
+            self._tick(interval)
+
+    def stop(self):
+        if self._job is not None:
+            try:
+                self.after_cancel(self._job)
+            except Exception:
+                pass
+            self._job = None
+
+    def _tick(self, interval):
+        self._pos = (self._pos + 0.035) % 1.0
+        self.redraw()
+        self._job = self.after(interval, lambda: self._tick(interval))
+
+    def redraw(self):
+        self.delete("all")
+        w, h = self.size()
+        m = T.M
+        track = ui_draw.rounded_rect((w, h), h // 2, fill="#E6E2DB")
+        self.create_image(0, 0, anchor="nw", image=T.photo(track, key=("track", w, h)))
+        bar_w = max(h * 2, int(w * 0.32))
+        span = w + bar_w
+        x = int(self._pos * span) - bar_w
+        x0 = max(0, x)
+        x1 = min(w, x + bar_w)
+        if x1 > x0:
+            bar = ui_draw.rounded_rect((x1 - x0, h), h // 2,
+                                       fill=T.PRIMARY, corners=(
+                                           x == x0, x + bar_w == x1,
+                                           x + bar_w == x1, x == x0))
+            self.create_image(x0, 0, anchor="nw",
+                              image=T.photo(bar, key=("bar", x1 - x0, h, x0 == x,
+                                                      x + bar_w == x1)))
+
 
 def label(master, text="", size=19, bold=False, color=None, bg=None, **kw):
     return tk.Label(master, text=text, font=T.font_obj(size, bold),
