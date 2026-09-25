@@ -159,7 +159,7 @@ def hline(size, color, thickness=1):
     return img
 
 
-def dashed_round_rect(size, radius=0, color="#C9C2B8", width=1, dash=5, gap=4):
+def dashed_round_rect(size, radius=0, color="#C3D2E6", width=1, dash=5, gap=4):
     """虚线圆角框（拖放区用）。
 
     Pillow 没有现成的虚线，所以沿四条直边按「画 dash、跳 gap」逐段描；
@@ -365,11 +365,13 @@ _PAINTERS = {
 ICON_NAMES = tuple(sorted(_PAINTERS))
 
 
-def icon(name, size=16, color="#333A42", stroke=1.7):
+def icon(name, size=16, color="#334155", stroke=1.7):
     """画一个图标，返回抗锯齿后的 RGBA 图。
 
-    name 见 ICON_NAMES；size 是边长（像素）；stroke 是线宽（按 24 网格计）。
-    """
+      name 见 ICON_NAMES；size 是边长（像素）；stroke 是线宽（按 24 网格计）。
+      color 的默认值只是「本层单独使用时」的兜底 —— 本层刻意不导入 ui_theme（那会牵进 tkinter），
+      实际颜色由调用方传 `T.*` 常量进来，所以**改配色只改 ui_theme 一处**。
+      """
     if name not in _PAINTERS:
         raise ValueError("没有这个图标：%r，可用：%s" % (name, "、".join(ICON_NAMES)))
     S = max(1, int(size)) * SS
@@ -379,7 +381,7 @@ def icon(name, size=16, color="#333A42", stroke=1.7):
     return img.resize((int(size), int(size)), Image.LANCZOS)
 
 
-def app_icon(size=64, color="#3B5C83", accent="#43658B"):
+def app_icon(size=64, color="#2563EB", accent="#3B82F6"):
     """窗口/任务栏图标：一个圆角方块 + 向内压缩的双箭头。"""
     img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     pad = max(1, size // 16)

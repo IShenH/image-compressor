@@ -35,32 +35,49 @@ def lv(x):
     """逻辑像素 → 设备像素。"""
     return max(1, int(round(x * DPI_SCALE)))
 
-# 设计稿配色（Pillow 取样所得）
-PAGE_BG = "#F3EEE7"       # 页面底色
-CARD_BG = "#F7F5F0"       # 卡片底色
-CARD_BG_SOFT = "#F9F4EE"
-BORDER = "#E4DED8"        # 卡片边框 / 分隔线
-BORDER_SOFT = "#EAE4DE"
-PRIMARY_TOP = "#43658B"   # 主按钮渐变顶
-PRIMARY_BOT = "#395B80"   # 主按钮渐变底
-PRIMARY = "#3B5C83"       # 主色
-PRIMARY_DEEP = "#2E4A6B"  # 按下
-PRIMARY_SOFT = "#406185"  # 选择图片按钮
-ACCENT = "#B7DFF9"        # 浅蓝辅助
-SELECTED_BG = "#EDF1F6"   # 选中卡片底色
-SELECTED_BORDER = "#7A9BC0"
-DISABLED_BG = "#E9E6E0"
-DISABLED_FG = "#A9A49C"
+# ---------------------------------------------------------------- 配色
+# 蓝白主题。三条原则：
+#   1. 卡片用**纯白**，靠浅蓝的页面底色衬托出层次，而不是靠深色边框
+#   2. 主蓝只用在「可点的东西」和选中态上 —— 到处都是蓝就不叫点缀了
+#   3. 中性色一律偏冷（蓝灰），不掺暖调，否则会和蓝撞出脏色
+PAGE_BG = "#EAF0F9"        # 页面底色（浅蓝）
+CARD_BG = "#FFFFFF"        # 卡片底色（纯白）
+CARD_BG_SOFT = "#F5F8FD"
+BORDER = "#DCE5F2"         # 卡片边框
+BORDER_SOFT = "#E8EFF8"    # 分隔线
 
-TEXT = "#333A42"          # 正文
-TEXT_STRONG = "#22282F"   # 标题
-TEXT_MUTED = "#6E6D69"    # 次要说明
-TEXT_FAINT = "#9A968E"    # 未填的占位符「—」
+PRIMARY_TOP = "#3B82F6"    # 主按钮渐变顶（浅）
+PRIMARY_BOT = "#2563EB"    # 主按钮渐变底（深）
+PRIMARY = "#2563EB"        # 主色
+PRIMARY_DEEP = "#1D4ED8"   # 按下态
+PRIMARY_SOFT = "#3B82F6"
+ACCENT = "#DBEAFE"         # 浅蓝辅助
+
+SECONDARY_TOP = "#FFFFFF"  # 次要按钮：白 → 极浅蓝
+SECONDARY_BOT = "#EDF3FC"
+SECONDARY_BORDER = "#D3E0F2"
+
+SELECTED_BG = "#EFF6FF"    # 选中卡片底色（极浅蓝）
+SELECTED_BORDER = "#2563EB"
+RADIO_OFF = "#C3D0E2"      # 未选中的圆点/方框边
+DISABLED_BG = "#E7EDF6"
+DISABLED_FG = "#A5B2C4"
+
+TEXT = "#334155"           # 正文
+TEXT_STRONG = "#0F172A"    # 标题
+TEXT_MUTED = "#64748B"     # 次要说明
+TEXT_FAINT = "#94A3B8"     # 未填的占位符「—」
 ON_PRIMARY = "#FFFFFF"
 
-GOOD = "#3F7A57"
-WARN = "#8A6D00"
-BAD = "#C0392B"
+DASH_BORDER = "#C3D2E6"    # 拖放区虚线
+PLACEHOLDER = "#C3CFE2"    # 预览框里的占位图标
+PREVIEW_BG = "#E6EEF9"     # 预览框底
+TRACK_BG = "#E3EAF5"       # 进度条轨道
+FIELD_BG = "#FFFFFF"       # 数字框底
+
+GOOD = "#15803D"
+WARN = "#B45309"
+BAD = "#DC2626"
 
 # 字体族：按可用性挑第一个。注意有的字体只注册了中文名或只注册了 UI 变体
 # （本机有 `Microsoft YaHei UI` 但没有 `Microsoft YaHei`），所以两个名字都要试。
@@ -351,18 +368,22 @@ def secondary_button_image(w, h, state="normal"):
         base = ui_draw.hgradient((w, h), DISABLED_BG, DISABLED_BG,
                                  radius=M.radius_small)
     else:
-        base = ui_draw.hgradient((w, h), "#FBFAF7", "#EEF2F7",
+        base = ui_draw.hgradient((w, h), SECONDARY_TOP, SECONDARY_BOT,
                                  radius=M.radius_small)
     base.alpha_composite(
         ui_draw.rounded_rect((w, h), M.radius_small,
-                             outline="#DCE3EC" if state != "disabled" else "#DCD8D1",
+                             outline=SECONDARY_BORDER if state != "disabled" else BORDER,
                              width=1))
     return base
 
 
 def choice_card_image(w, h, selected):
-    """档位卡片底。选中时换底色与边框色。"""
-    fill = SELECTED_BG if selected else CARD_BG
+    """档位卡片底。选中时换底色与边框色。
+
+    未选中用 CARD_BG_SOFT 而不是 CARD_BG —— 卡片本身已是纯白，
+    再叠一个纯白的子卡片就只剩一条边框，层次会糊掉。
+    """
+    fill = SELECTED_BG if selected else CARD_BG_SOFT
     border = SELECTED_BORDER if selected else BORDER
     img = ui_draw.rounded_rect((w, h), M.radius, fill=fill)
     img.alpha_composite(

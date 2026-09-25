@@ -297,7 +297,7 @@ class App:
         # 文案在左、按钮在右，压成一行 —— 最省高度，也最接近设计稿的横向排布
         x, y, w, h = self.rects["drop"]
         bg.alpha_composite(
-            ui_draw.dashed_round_rect((w, h), m.radius, color="#CFC8BE",
+            ui_draw.dashed_round_rect((w, h), m.radius, color=T.DASH_BORDER,
                                       width=1, dash=6, gap=5), (x, y))
         d = ImageDraw.Draw(bg)
         left = x + m.s(44)
@@ -749,7 +749,7 @@ class App:
         m = T.M
         w, h = m.preview_w, m.preview_h
         r = m.radius                  # 框大了，小圆角会显得局促
-        img = ui_draw.rounded_rect((w, h), r, fill="#EDEAE4")
+        img = ui_draw.rounded_rect((w, h), r, fill=T.PREVIEW_BG)
 
         if self.thumb_pil is not None:
             photo = self.thumb_pil
@@ -761,7 +761,7 @@ class App:
             photo = photo.crop((left, top, left + w, top + h))
             img.paste(photo, (0, 0), ui_draw.aa_mask((w, h), r))
         else:
-            glyph = ui_draw.icon("image", m.s(96), "#C6C0B7", stroke=1.4)
+            glyph = ui_draw.icon("image", m.s(96), T.PLACEHOLDER, stroke=1.4)
             img.alpha_composite(glyph, ((w - glyph.width) // 2,
                                         (h - glyph.height) // 2))
 

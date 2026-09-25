@@ -184,8 +184,10 @@ class ChoiceCard(Control):
     def __init__(self, master, name, desc, icon, value, variable,
                  command=None, width=170, height=None, bg=None, **kw):
         h = T.M.card_h if height is None else height
+        # 默认底色跟 choice_card_image 的「未选中」一致：圆角外面露出的是这个色，
+        # 若仍用纯白，卡片四个角会挂一圈白边。
         super().__init__(master, width=width, height=h,
-                         bg=bg if bg is not None else T.CARD_BG, **kw)
+                         bg=bg if bg is not None else T.CARD_BG_SOFT, **kw)
         self._name = name
         self._desc = desc
         self._icon = icon
@@ -223,7 +225,7 @@ class ChoiceCard(Control):
 
         # 单选圆点
         rr = m.s(11)
-        ring_color = T.PRIMARY if sel else "#BDB7AE"
+        ring_color = T.PRIMARY if sel else T.RADIO_OFF
         ring = ui_draw.rounded_rect((rr * 2, rr * 2), rr, outline=ring_color,
                                     width=2)
         self.create_image(pad, top - rr, anchor="nw",
@@ -242,7 +244,7 @@ class ChoiceCard(Control):
         # 右侧小图标
         ico_size = m.s(30)
         glyph = ui_draw.icon(self._icon, ico_size,
-                             T.PRIMARY if sel else "#9A968E", stroke=1.7)
+                             T.PRIMARY if sel else T.TEXT_FAINT, stroke=1.7)
         self.create_image(w - pad, top, anchor="e",
                           image=T.photo(glyph, key=("cico", self._icon,
                                                     ico_size, sel)))
@@ -314,10 +316,10 @@ class FlatCheck(Control):
         on = bool(self._var.get())
         box = m.s(34)
 
-        fill = T.PRIMARY if on else "#FFFFFF"
-        edge = T.PRIMARY if on else "#C6C0B7"
+        fill = T.PRIMARY if on else T.FIELD_BG
+        edge = T.PRIMARY if on else T.RADIO_OFF
         if not self.enabled:
-            fill, edge = ("#D5D1CA" if on else "#F0EDE8"), T.DISABLED_FG
+            fill, edge = (T.DISABLED_FG if on else T.DISABLED_BG), T.DISABLED_FG
         square = ui_draw.rounded_rect((box, box), m.s(8), fill=fill,
                                       outline=edge, width=1)
         self.create_image(0, (h - box) // 2, anchor="w",
@@ -350,7 +352,7 @@ class NumberField(Control):
         self.maximum = maximum
         self._command = command
         self.entry = tk.Entry(self, textvariable=variable, bd=0,
-                              highlightthickness=0, bg="#FFFFFF",
+                              highlightthickness=0, bg=T.FIELD_BG,
                               disabledbackground=T.DISABLED_BG,
                               disabledforeground=T.DISABLED_FG,
                               justify="right", font=T.font_obj(19),
@@ -383,7 +385,7 @@ class NumberField(Control):
         w, h = self.size()
         m = T.M
         base = ui_draw.rounded_rect((w, h), m.radius_small,
-                                    fill=T.DISABLED_BG if not self.enabled else "#FFFFFF",
+                                    fill=T.DISABLED_BG if not self.enabled else T.FIELD_BG,
                                     outline=T.BORDER, width=1)
         self.create_image(0, 0, anchor="nw", image=T.photo(base, key=("num", w, h, self.enabled)))
 
@@ -441,7 +443,7 @@ class ThinProgress(Control):
         self.delete("all")
         w, h = self.size()
         m = T.M
-        track = ui_draw.rounded_rect((w, h), h // 2, fill="#E6E2DB")
+        track = ui_draw.rounded_rect((w, h), h // 2, fill=T.TRACK_BG)
         self.create_image(0, 0, anchor="nw", image=T.photo(track, key=("track", w, h)))
         bar_w = max(h * 2, int(w * 0.32))
         span = w + bar_w
