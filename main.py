@@ -9,8 +9,10 @@
 """
 
 import os
+import queue
 import shutil
 import tempfile
+import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
@@ -31,6 +33,11 @@ FORMAT_LABELS = {"JPEG": "JPEG", "PNG": "PNG", "WEBP": "WebP"}
 
 # 压缩收益低于这个比例时，如实提示用户「省得不多」（见 requirement.md §5）
 LOW_GAIN_THRESHOLD = 0.10
+
+# 后台线程跑起来之后，主线程每隔这么久去看一眼有没有结果。
+# 关键：**不能用 join() 等它** —— join 会把主线程一起堵住，
+# 界面照样卡死，那就等于白开了线程。
+POLL_INTERVAL_MS = 60
 
 
 def enable_dpi_awareness():
@@ -97,6 +104,12 @@ class App:
         self.limit_size = tk.BooleanVar(value=False)
         self.max_dimension = tk.StringVar(value="1920")
 
+        # 后台线程跑完只把结果放进这个队列，绝不直接碰界面 ——
+        # tkinter 不是线程安全的，跨线程操作控件会随机崩溃。
+        self.queue = queue.Queue()
+        self.busy = False
+        self.input_widgets = []  # 压缩期间需要一并禁用的控件
+
         self._build_ui()
         self._refresh_buttons()
 
@@ -111,18 +124,19 @@ class App:
         style.configure("Warn.TLabel", foreground="#8a6d00")
         style.configure("Bad.TLabel", foreground="#c0392b")
 
-        outer = ttk.Frame(self.root, padding=16)
+        outer = ttk.Frame(self.root, padding=12)
         outer.grid(row=0, column=0, sticky="nsew")
         outer.columnconfigure(0, weight=1)
         row = 0
 
         # ---- 选择图片 ----
-        ttk.Button(outer, text="选择图片…", command=self.choose_file).grid(
-            row=row, column=0, sticky="w")
+        self.choose_btn = ttk.Button(outer, text="选择图片…", command=self.choose_file)
+        self.choose_btn.grid(row=row, column=0, sticky="w")
+        self.input_widgets.append(self.choose_btn)
         row += 1
 
         # ---- 原图信息 ----
-        info_box = ttk.LabelFrame(outer, text="原图信息", padding=(12, 8, 12, 10))
+        info_box = ttk.LabelFrame(outer, text="原图信息", padding=(10, 6, 10, 6))
         info_box.grid(row=row, column=0, sticky="ew", pady=(12, 0))
         self.info_vars = {}
         for i, (key, title) in enumerate([
@@ -135,11 +149,13 @@ class App:
         row += 1
 
         # ---- 压缩档位 ----
-        level_box = ttk.LabelFrame(outer, text="压缩档位", padding=(12, 8, 12, 10))
+        level_box = ttk.LabelFrame(outer, text="压缩档位", padding=(10, 6, 10, 6))
         level_box.grid(row=row, column=0, sticky="ew", pady=(12, 0))
         for i, (key, name, desc) in enumerate(LEVEL_CHOICES):
-            ttk.Radiobutton(level_box, text=name, value=key, variable=self.level,
-                            command=self._on_level_change).grid(row=i, column=0, sticky="w")
+            radio = ttk.Radiobutton(level_box, text=name, value=key, variable=self.level,
+                                    command=self._on_level_change)
+            radio.grid(row=i, column=0, sticky="w")
+            self.input_widgets.append(radio)
             ttk.Label(level_box, text=desc).grid(row=i, column=1, sticky="w", padx=(12, 0))
         # 文案要短：系统缩放 125%/150% 时字体会等比放大，长文案会折成难看的碎片
         ttk.Label(level_box, foreground="#777",
@@ -149,14 +165,18 @@ class App:
         row += 1
 
         # ---- 输出尺寸 ----
-        size_box = ttk.LabelFrame(outer, text="输出尺寸", padding=(12, 8, 12, 10))
-        size_box.grid(row=row, column=0, sticky="ew", pady=(12, 0))
-        ttk.Checkbutton(size_box, text="限制最长边", variable=self.limit_size,
-                        command=self._on_size_change).grid(row=0, column=0, sticky="w")
+        size_box = ttk.LabelFrame(outer, text="输出尺寸", padding=(10, 6, 10, 6))
+        size_box.grid(row=row, column=0, sticky="ew", pady=(8, 0))
+        self.size_check = ttk.Checkbutton(size_box, text="限制最长边",
+                                          variable=self.limit_size,
+                                          command=self._on_size_change)
+        self.size_check.grid(row=0, column=0, sticky="w")
+        self.input_widgets.append(self.size_check)
         self.size_spin = ttk.Spinbox(size_box, from_=64, to=20000, increment=100,
                                      width=7, textvariable=self.max_dimension,
                                      command=self._on_size_change)
         self.size_spin.grid(row=0, column=1, sticky="w", padx=(8, 4))
+        self.input_widgets.append(self.size_spin)
         # 手动输入不会触发 command，得单独监听按键，否则结果会停留在旧尺寸上
         self.size_spin.bind("<KeyRelease>", lambda _e: self._on_size_change())
         ttk.Label(size_box, text="像素").grid(row=0, column=2, sticky="w")
@@ -166,12 +186,18 @@ class App:
 
         # ---- 执行压缩 ----
         self.compress_btn = ttk.Button(outer, text="压缩", command=self.do_compress)
-        self.compress_btn.grid(row=row, column=0, sticky="ew", pady=(12, 0))
+        self.compress_btn.grid(row=row, column=0, sticky="ew", pady=(8, 0))
+        row += 1
+
+        # 进度条只在压缩期间出现，空闲时收起来，不占地方
+        self.progress = ttk.Progressbar(outer, mode="indeterminate")
+        self.progress.grid(row=row, column=0, sticky="ew", pady=(6, 0))
+        self.progress.grid_remove()
         row += 1
 
         # ---- 压缩结果 ----
-        result_box = ttk.LabelFrame(outer, text="压缩结果", padding=(12, 8, 12, 10))
-        result_box.grid(row=row, column=0, sticky="ew", pady=(12, 0))
+        result_box = ttk.LabelFrame(outer, text="压缩结果", padding=(10, 6, 10, 6))
+        result_box.grid(row=row, column=0, sticky="ew", pady=(8, 0))
         # 只有数值列（第 1 列）吸收多余宽度。
         # 不给第 0 列权重，否则标签列会撑开、把数值挤到窗口最右边甚至裁掉。
         result_box.columnconfigure(1, weight=1)
@@ -204,7 +230,7 @@ class App:
 
         # ---- 保存 ----
         self.save_btn = ttk.Button(outer, text="保存压缩后的图片…", command=self.do_save)
-        self.save_btn.grid(row=row, column=0, sticky="ew", pady=(12, 0))
+        self.save_btn.grid(row=row, column=0, sticky="ew", pady=(8, 0))
 
     # ---------------- 事件处理 ----------------
 
@@ -266,46 +292,99 @@ class App:
         self.do_compress()
 
     def do_compress(self):
-        if self.info is None:
+        if self.info is None or self.busy:
             return
 
-        self.root.config(cursor="watch")
-        # 先让界面重绘一次。不调用的话，鼠标忙碌光标要等压缩跑完才出现，
-        # 用户会觉得程序卡死了 —— 因为 tkinter 只在「空闲」时才刷新界面。
-        self.root.update_idletasks()
         # 只有勾了「限制最长边」才传这个参数；没勾时传 None，表示完全不动尺寸
         max_dim = self.max_dimension.get().strip() if self.limit_size.get() else None
+        self._set_busy(True)
+
+        # 压缩交给后台线程。编码大图要好几秒，放在主线程会把窗口卡死；
+        # 而 tkinter 的界面刷新全靠主线程 —— 主线程一忙，连「正在压缩」都画不出来。
+        threading.Thread(
+            target=self._compress_worker,
+            args=(self.info.path, self.tmp_base, self.level.get(),
+                  self.force_format, max_dim),
+            daemon=True,  # 窗口关掉时线程跟着结束，不会把进程吊住
+        ).start()
+        self.root.after(POLL_INTERVAL_MS, self._poll_result)
+
+    def _compress_worker(self, src, dst, level, fmt, max_dim):
+        """后台线程：只干活，只往队列里放结果，**绝不碰任何控件**。
+
+        tkinter 不是线程安全的，在工作线程里操作控件会随机崩溃 ——
+        而且这种崩溃往往在测试时看不出来，到了用户手里才偶发。
+        """
         try:
-            self.result = compressor.compress(
-                self.info.path, self.tmp_base, self.level.get(),
-                output_format=self.force_format, max_dimension=max_dim)
-            self.pending_suggestion = self.result.suggestion
-            self.pending_level = None
-        except compressor.NoGainError as exc:
-            # 压不小：不产出比原图更大的文件，改为如实告知，并把可行的出路摆出来
-            self.result = None
-            self.pending_suggestion = exc.suggestion
-            self.pending_level = exc.suggested_level
-            messagebox.showwarning("压不小", str(exc))
+            result = compressor.compress(src, dst, level, output_format=fmt,
+                                         max_dimension=max_dim)
+            self.queue.put(("ok", result))
         except compressor.CompressError as exc:
-            self.result = None
-            self.pending_suggestion = None
+            self.queue.put(("error", exc))
+        except Exception as exc:
+            # 兜底：不能让线程悄无声息地死掉，否则界面会永远停在「正在压缩」
+            self.queue.put(("crash", exc))
+
+    def _poll_result(self):
+        """主线程：隔一会儿看一次队列。
+
+        用轮询而不是 join()，是因为 join 会把主线程一起堵住，界面照样卡死。
+        """
+        try:
+            kind, payload = self.queue.get_nowait()
+        except queue.Empty:
+            self.root.after(POLL_INTERVAL_MS, self._poll_result)
+            return
+
+        self._set_busy(False)
+
+        if kind == "ok":
+            self.result = payload
+            self.pending_suggestion = payload.suggestion
             self.pending_level = None
-            messagebox.showerror("压缩失败", str(exc))
-        finally:
-            self.root.config(cursor="")
+        else:
+            self.result = None
+            self.pending_suggestion = getattr(payload, "suggestion", None)
+            self.pending_level = getattr(payload, "suggested_level", None)
+            if isinstance(payload, compressor.NoGainError):
+                # 压不小：不产出比原图更大的文件，改为如实告知，并把出路摆出来
+                messagebox.showwarning("压不小", str(payload))
+            elif kind == "crash":
+                messagebox.showerror("出错了", f"压缩时发生意外错误：{payload}")
+            else:
+                messagebox.showerror("压缩失败", str(payload))
 
         self._show_result()
         self._refresh_buttons()
 
+    def _set_busy(self, busy):
+        """切换「正在压缩」状态：禁用输入、显示进度条、换忙碌光标。"""
+        self.busy = busy
+        if busy:
+            self.root.config(cursor="watch")
+            self.compress_btn.configure(text="正在压缩…")
+            self.progress.grid()
+            self.progress.start(12)
+        else:
+            self.root.config(cursor="")
+            self.compress_btn.configure(text="压缩")
+            self.progress.stop()
+            self.progress.grid_remove()
+        self._refresh_buttons()
+
     def do_save(self):
         """弹出保存对话框。真正的写入逻辑在 save_to 里，方便单独测试。"""
+        # 正常情况下「保存」按钮是禁用的，点不到这里；
+        # 但这个前提不该只靠按钮状态来保证 —— 直接在代码里也挡一道。
+        if self.result is None:
+            return
         ext = compressor.EXTENSIONS[self.result.output_format]
         stem = os.path.splitext(self.info.file_name)[0]
         path = filedialog.asksaveasfilename(
             title="保存压缩后的图片",
             defaultextension=ext,
-            initialfile=f"{stem}_compressed{ext}",
+            # 默认名带上档位：同张图试不同档位时，不至于全叫 xxx_compressed
+            initialfile=f"{stem}_{self.level.get()}{ext}",
             filetypes=[(f"{FORMAT_LABELS[self.result.output_format]} 图片", f"*{ext}")],
         )
         if path:
@@ -408,10 +487,21 @@ class App:
         self._update_suggestion_buttons()
 
     def _refresh_buttons(self):
-        self.compress_btn.state(["!disabled"] if self.info else ["disabled"])
-        self.save_btn.state(["!disabled"] if self.result else ["disabled"])
+        self.compress_btn.state(
+            ["!disabled"] if (self.info and not self.busy) else ["disabled"])
+        self.save_btn.state(
+            ["!disabled"] if (self.result and not self.busy) else ["disabled"])
+        # 压缩期间不许改设置 —— 否则界面显示的选择，和正在后台跑的那个任务会对不上
+        for widget in self.input_widgets:
+            widget.state(["disabled"] if self.busy else ["!disabled"])
+        for widget in (self.suggest_btn, self.restore_btn):
+            widget.state(["disabled"] if self.busy else ["!disabled"])
 
     def _on_close(self):
+        # 后台还在跑时先问一句 —— 直接退出等于把用户刚等的几十秒丢进垃圾桶
+        if self.busy and not messagebox.askyesno(
+                "仍在压缩", "压缩还没完成，现在退出会丢弃已经算出的结果。\n确定要退出吗？"):
+            return
         shutil.rmtree(self.tmpdir, ignore_errors=True)
         self.root.destroy()
 
