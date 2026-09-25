@@ -136,6 +136,9 @@ def work_area():
     return None
 
 
+_frame_cache = (0, 0)
+
+
 def frame_overhead(root):
     """窗口外框比客户区多出来的部分 (横向, 纵向)。
 
@@ -143,6 +146,7 @@ def frame_overhead(root):
     本机 150% 缩放下公式给 45px，实测是 56px（还差一层窗口阴影）。
     做法是把窗口先摆到屏幕外，量完再挪回来，避免开机闪一下。
     """
+    global _frame_cache
     try:
         import ctypes
         root.geometry("1x1+-3000+-3000")
@@ -153,10 +157,24 @@ def frame_overhead(root):
         r = RECT()
         if not ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(r)):
             return 0, 0
-        return (r.right - r.left) - root.winfo_width(), \
-               (r.bottom - r.top) - root.winfo_height()
+        _frame_cache = ((r.right - r.left) - root.winfo_width(),
+                        (r.bottom - r.top) - root.winfo_height())
     except Exception:
-        return 0, 0
+        _frame_cache = (0, 0)
+    return _frame_cache
+
+
+def center_geometry(root, w, h):
+    """居中摆放的 geometry 字符串。
+
+    ⚠️ 必须把边框开销算进去：`geometry()` 设的是**客户区**，
+    按客户区居中会让整个窗口偏右下（外框比客户区大一圈）。
+    """
+    area = work_area() or (root.winfo_screenwidth(), root.winfo_screenheight())
+    fw, fh = _frame_cache
+    x = max(0, (area[0] - (w + fw)) // 2)
+    y = max(0, (area[1] - (h + fh)) // 2)
+    return "%dx%d+%d+%d" % (w, h, x, y)
 
 
 def init(root, margin=8):
@@ -197,6 +215,7 @@ def init(root, margin=8):
     # 尺寸变了，之前按旧尺寸缓存的字体与图片都不能再用
     clear_cache()
     _font_cache.clear()
+    _pil_font_cache.clear()
     return client_w, client_h
 
 
@@ -225,6 +244,49 @@ def clear_cache():
 
 
 _font_cache = {}
+_pil_font_cache = {}
+
+# tkinter 字体族名 → 对应的字体文件（正体, 粗体）
+_FONT_FILES = {
+    "Microsoft YaHei UI": ("msyh.ttc", "msyhbd.ttc"),
+    "微软雅黑": ("msyh.ttc", "msyhbd.ttc"),
+    "Microsoft YaHei": ("msyh.ttc", "msyhbd.ttc"),
+    "等线": ("Deng.ttf", "Dengb.ttf"),
+    "黑体": ("simhei.ttf", "simhei.ttf"),
+    "Segoe UI": ("segoeui.ttf", "segoeuib.ttf"),
+}
+
+
+def pil_font(ref_size, bold=False):
+    """PIL 用的字体对象（把静态文字画进背景图时用）。
+
+    ⚠️ tkinter 与 PIL 是两套文字渲染，同一族、同一像素尺寸下字形仍有细微差别。
+    所以约定：**一行文字不要在两边各画一半** ——
+    静态的整行交给背景图，动态的整行交给 tkinter 控件。
+    """
+    key = (int(ref_size), bool(bold))
+    if key in _pil_font_cache:
+        return _pil_font_cache[key]
+
+    import os
+
+    from PIL import ImageFont
+
+    px = M.s(ref_size)
+    files = _FONT_FILES.get(FONT_FAMILY, ("msyh.ttc", "msyhbd.ttc"))
+    fonts_dir = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts")
+    for name in (files[1 if bold else 0], files[0], "simhei.ttf", "segoeui.ttf"):
+        path = os.path.join(fonts_dir, name)
+        if os.path.isfile(path):
+            try:
+                font = ImageFont.truetype(path, px)
+                _pil_font_cache[key] = font
+                return font
+            except Exception:
+                continue
+    font = ImageFont.load_default()
+    _pil_font_cache[key] = font
+    return font
 
 
 def font_obj(ref_size, bold=False):
