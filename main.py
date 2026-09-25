@@ -19,6 +19,10 @@ from tkinter import filedialog, messagebox, ttk
 import compressor
 
 
+# 版本号。改这里的同时要更新 CHANGELOG.md
+__version__ = "1.0.0"
+
+
 # 档位：压缩逻辑使用的键名 → 界面显示名称与说明。
 # 键名属于逻辑层（见 compressor.LEVELS），中文文案属于界面层，所以映射放在这里。
 LEVEL_CHOICES = [
@@ -118,7 +122,7 @@ class App:
     # ---------------- 界面搭建 ----------------
 
     def _build_ui(self):
-        self.root.title("图片压缩工具")
+        self.root.title(f"图片压缩工具 {__version__}")
 
         style = ttk.Style()
         style.configure("Warn.TLabel", foreground="#8a6d00")
