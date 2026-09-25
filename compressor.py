@@ -48,7 +48,6 @@ class NoGainError(CompressError):
 # 高画质**没有**取 q=90：真实照片大多本来就压在 q≈90，再按 q=90 重存会得到
 # 「节省 0.0%」，等于按钮按下去没反应。而 q=85 的像素偏差与 q=90 几乎相同
 # （1.25 对 1.19，肉眼不可分），却能实打实省下 14.5%。
-# 完整数据见 docs/research/image-compression-experiments.md。
 # ---------------------------------------------------------------------------
 LEVELS = {
     "small": 50,
@@ -350,7 +349,7 @@ def _pick_target_format(info: ImageInfo, requested) -> str:
     """决定输出格式。
 
     requested 为 None 表示「保持源格式」—— 这是默认行为，
-    因为用户没有要求转换格式时，程序不该擅自替他决定（见 requirement.md §7）。
+    因为用户没有要求转换格式时，程序不该擅自替他决定。
     """
     if requested:
         fmt = requested.upper()

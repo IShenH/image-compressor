@@ -35,7 +35,7 @@ DEFAULT_LEVEL = "balanced"
 # 格式在界面上的写法
 FORMAT_LABELS = {"JPEG": "JPEG", "PNG": "PNG", "WEBP": "WebP"}
 
-# 压缩收益低于这个比例时，如实提示用户「省得不多」（见 requirement.md §5）
+# 压缩收益低于这个比例时，如实提示用户「省得不多」
 LOW_GAIN_THRESHOLD = 0.10
 
 # 后台线程跑起来之后，主线程每隔这么久去看一眼有没有结果。
@@ -221,7 +221,7 @@ class App:
         self.note_label.grid_remove()
 
         # 建议按钮：只有在「换个做法能压得更小」时才出现。
-        # 是否换格式由用户点它决定 —— 程序不擅自替他改格式（requirement.md §7）。
+        # 是否换格式由用户点它决定 —— 程序不擅自替他改格式。
         self.suggest_btn = ttk.Button(result_box, text="", command=self.apply_suggestion)
         self.suggest_btn.grid(row=last + 1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         self.suggest_btn.grid_remove()
@@ -399,7 +399,7 @@ class App:
         if self.result is None:
             return False
 
-        # requirement.md §6：不得无提示覆盖原始文件。
+        # 不得无提示覆盖原始文件。
         # 用 normcase 是为了在 Windows 上把大小写差异也算作同一个文件。
         if os.path.normcase(os.path.abspath(path)) == \
                 os.path.normcase(os.path.abspath(self.info.path)):
@@ -442,7 +442,7 @@ class App:
         gain = 1 - r.ratio
         self.result_vars["saved"].set(f"{gain * 100:.1f}%")
 
-        # 如实反馈：不把「省得不多」甚至「反而更大」包装成成功优化（requirement.md §5）
+        # 如实反馈：不把「省得不多」甚至「反而更大」包装成成功优化
         if r.saved_bytes <= 0:
             note = "注意：压缩后反而变大了。这张图本来就压得很紧，或者不适合这个格式。"
             style = "Bad.TLabel"
