@@ -24,3 +24,7 @@ PROJECT.md
 ROADMAP.md
 TASKS.md
 AGENTS.md
+
+# 项目文档目录（决策记录、实验数据、架构说明、学习笔记）：同样只在本地维护。
+docs/
+CHANGELOG.md
