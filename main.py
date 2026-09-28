@@ -35,7 +35,7 @@ import viewer
 
 
 # 版本号。改这里的同时要更新 CHANGELOG.md
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 
 # 档位：压缩逻辑使用的键名 → 界面显示名称、说明、图标。
