@@ -337,6 +337,23 @@ class GuiTest(unittest.TestCase):
         self.assertAlmostEqual(
             V.fit_zoom(self.v.display.size, self.v._viewport()), self.v.zoom)
 
+    def test_fullscreen_toggle_and_escape_semantics(self):
+        """F11 进全屏；Esc 先退出全屏、再按才是关窗。"""
+        self.v.open_path(self.a)
+        self.wait_success()
+        self.v.top.focus_force()
+        self.pump()
+        self.v.top.event_generate("<F11>")
+        self.pump()
+        self.assertTrue(self.v.top.attributes("-fullscreen"))
+        self.v.top.event_generate("<Escape>")
+        self.pump()
+        self.assertFalse(self.v.top.attributes("-fullscreen"))
+        self.assertTrue(self.v.top.winfo_exists(), "Esc 应当先退出全屏而不是关窗")
+        self.v.top.event_generate("<Escape>")
+        self.pump()
+        self.assertFalse(self.v.top.winfo_exists())
+
     # ---------------- 缩略图 ----------------
 
     def test_thumbnails_fill_in_and_selection_follows(self):

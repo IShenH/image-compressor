@@ -185,6 +185,7 @@ class ViewerWindow:
         self.fit_mode = True      # True=适应窗口（跟随窗口尺寸重算）
         self.rotation = 0
         self.offset = (0, 0)
+        self._fullscreen = False
 
         # ---- 线程通信 ----
         self._closed = False
@@ -297,7 +298,8 @@ class ViewerWindow:
         self.top.bind("<f>", lambda _e: self.fit_view())
         self.top.bind("<F>", lambda _e: self.fit_view())
         self.top.bind("<1>", lambda _e: self._set_zoom(1.0))
-        self.top.bind("<Escape>", lambda _e: self.close())
+        self.top.bind("<F11>", lambda _e: self.toggle_fullscreen())
+        self.top.bind("<Escape>", self._on_escape)
         self.top.protocol("WM_DELETE_WINDOW", self.close)
 
         self._render()
@@ -632,6 +634,21 @@ class ViewerWindow:
         self.offset = clamp_offset((0, 0), self._disp_size(), self._viewport())
         self._render()
         self._update_status()
+
+    def toggle_fullscreen(self, *_):
+        """全屏开关（F11）。窗口尺寸变化由 <Configure> 事件自动跟上。"""
+        self._fullscreen = not self._fullscreen
+        try:
+            self.top.attributes("-fullscreen", self._fullscreen)
+        except tk.TclError:
+            self._fullscreen = False
+
+    def _on_escape(self, *_e):
+        """Esc：全屏时先退出全屏，否则关窗 —— 与看图软件的直觉一致。"""
+        if self._fullscreen:
+            self.toggle_fullscreen()
+        else:
+            self.close()
 
     def _on_canvas_configure(self, _e):
         """窗口尺寸变化。防抖：连续拖边框时不必每一像素都重算一遍。"""
