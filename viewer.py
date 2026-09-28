@@ -205,6 +205,10 @@ class ViewerWindow:
         self._anim_job = None
         self._anim_paused = False
 
+        # ---- 邻图预读：index -> 解码结果，翻页直接命中 ----
+        self._prefetch = {}
+        self._prefetch_hits = 0    # 仅供测试观察命中率
+
         self._build_window()
         self._poll()
 
@@ -392,8 +396,21 @@ class ViewerWindow:
         self._place_selection()
         self._scroll_thumb_to(index)
         self._update_nav_buttons()
-        threading.Thread(target=self._decode_worker,
-                         args=(token, index, path), daemon=True).start()
+        cached = self._prefetch.pop(index, None)
+        if cached is not None:
+            # 命中预读：把结果塞回同一条队列，成功处理逻辑只有一份
+            self._prefetch_hits += 1
+            self.queue.put(("img", token, index) + cached)
+        else:
+            threading.Thread(target=self._decode_worker,
+                             args=(token, index, path), daemon=True).start()
+
+    def _request_prefetch(self, index):
+        """把左右邻居各预读一张 —— 翻页时大概率直接命中缓存。"""
+        for j in (index - 1, index + 1):
+            if 0 <= j < len(self.images) and j not in self._prefetch:
+                threading.Thread(target=self._prefetch_worker,
+                                 args=(j, self.images[j]), daemon=True).start()
 
     def next_image(self, *_):
         if self.images:
@@ -405,31 +422,45 @@ class ViewerWindow:
 
     # ---------------- 解码线程 ----------------
 
-    def _decode_worker(self, token, index, path):
-        """后台解码。只往队列放结果，绝不碰控件。
+    def _decode_image(self, path):
+        """解码一张图 → (img, fmt, 动画帧|None, 帧时长|None)。
 
         动图（GIF）在这里把**全部帧**解出来 —— 带硬上限（帧数 × 总像素），
         超限就放弃动画只取第一帧：宁可不动，也不能吃内存吃到死。
+        主图解码与邻图预读共用这一条路径。
         """
+        with Image.open(path) as im:
+            im.load()
+            fmt = im.format or ""
+            frames = durations = None
+            if getattr(im, "is_animated", False):
+                n = im.n_frames
+                if n <= 200 and im.size[0] * im.size[1] * n <= 60_000_000:
+                    frames, durations = [], []
+                    for i in range(n):
+                        im.seek(i)
+                        frames.append(_normalize_mode(im.copy()))
+                        durations.append(max(20, int(im.info.get("duration") or 100)))
+                    im.seek(0)      # 下面还要取第一帧当静态底图
+            img = ImageOps.exif_transpose(im)
+        img = _normalize_mode(img)
+        return img, fmt, frames, durations
+
+    def _decode_worker(self, token, index, path):
+        """后台解码。只往队列放结果，绝不碰控件。"""
         try:
-            with Image.open(path) as im:
-                im.load()
-                fmt = im.format or ""
-                frames = durations = None
-                if getattr(im, "is_animated", False):
-                    n = im.n_frames
-                    if n <= 200 and im.size[0] * im.size[1] * n <= 60_000_000:
-                        frames, durations = [], []
-                        for i in range(n):
-                            im.seek(i)
-                            frames.append(_normalize_mode(im.copy()))
-                            durations.append(max(20, int(im.info.get("duration") or 100)))
-                        im.seek(0)      # 下面还要取第一帧当静态底图
-                img = ImageOps.exif_transpose(im)
-            img = _normalize_mode(img)
+            img, fmt, frames, durations = self._decode_image(path)
             self.queue.put(("img", token, index, img, fmt, frames, durations))
         except Exception as exc:
             self.queue.put(("img_err", token, index, str(exc)))
+
+    def _prefetch_worker(self, index, path):
+        """预读邻居。尽力而为：失败就当没预读过，不打扰任何人。"""
+        try:
+            img, fmt, frames, durations = self._decode_image(path)
+            self.queue.put(("prefetch", index, img, fmt, frames, durations))
+        except Exception:
+            pass
 
     def _thumb_worker(self, scan_id, paths):
         """后台逐张生成缩略图。draft() 让 JPEG 按缩略图尺寸就近解码，省一大截时间。"""
@@ -492,6 +523,14 @@ class ViewerWindow:
                 # 第一帧停够它自己的时长再开始推进
                 self._anim_job = self.top.after(
                     self._anim["durations"][0], self._anim_step)
+            self._request_prefetch(index)
+        elif kind == "prefetch":
+            _, index, img, fmt, frames, durations = item
+            if 0 <= index < len(self.images):
+                self._prefetch[index] = (img, fmt, frames, durations)
+                # 只留当前图旁边的预读，远处的丢弃，内存不失控
+                for k in [k for k in self._prefetch if abs(k - self.index) > 1]:
+                    del self._prefetch[k]
         elif kind == "img_err":
             _, token, index, message = item
             if token != self._load_token or index != self.index:
@@ -545,6 +584,7 @@ class ViewerWindow:
         c.delete("all")
         self._thumb_photos.clear()
         self._thumb_items.clear()
+        self._prefetch.clear()      # 图片列表变了，预读全部作废
         n = len(self.images)
         cw, ch = T.M.s(96), T.M.s(76)
         y0 = (self._strip_h - ch) // 2

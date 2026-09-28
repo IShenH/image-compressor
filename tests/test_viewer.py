@@ -368,6 +368,27 @@ class GuiTest(unittest.TestCase):
 
     # ---------------- 出口 ----------------
 
+    def test_prefetch_serves_next_image_from_cache(self):
+        """加载后左右邻居应被预读；翻页命中缓存而不再解码。"""
+        self.v.open_path(self.work)
+        self.wait_success()
+        ok = helpers.wait_until(lambda: 1 in self.v._prefetch,
+                                timeout=30, pump=self.pump)
+        self.assertTrue(ok, "邻居没有被预读")
+        self.v.next_image()
+        self.wait_success()
+        self.assertEqual(1, self.v.index)
+        self.assertEqual(1, self.v._prefetch_hits, "翻页应当命中预读缓存")
+
+    def test_prefetch_cleared_when_list_changes(self):
+        self.v.open_path(self.work)
+        self.wait_success()
+        ok = helpers.wait_until(lambda: 1 in self.v._prefetch,
+                                timeout=30, pump=self.pump)
+        self.assertTrue(ok)
+        self.v.open_path(self.a)          # 换一批图片
+        self.assertEqual({}, self.v._prefetch, "换列表后预读必须作废")
+
     def test_compress_callback_receives_current_path(self):
         self.v.open_path(self.a)
         self.wait_success()
