@@ -381,8 +381,39 @@ class GuiTest(unittest.TestCase):
             Image.new("RGB", (60, 40), (10, 120, 200)).save(g, "GIF")
             self.v.open_path(g)
             self.wait_success()
+            self.assertIsNone(self.v._anim, "单帧 GIF 不该进入动画状态")
             self.assertIn("GIF", self.v.status_right.get())
             self.assertIn("第一帧", self.v.status_right.get())
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_gif_animates_and_pauses(self):
+        d = tempfile.mkdtemp(prefix="viewer_anim_")
+        try:
+            g = os.path.join(d, "x.gif")
+            jpg = os.path.join(d, "y.jpg")
+            frames = [Image.new("RGB", (60, 40), c) for c in
+                      ((255, 0, 0), (0, 255, 0), (0, 0, 255))]
+            frames[0].save(g, save_all=True, append_images=frames[1:],
+                           duration=60, loop=0)
+            make_img(jpg, (80, 60))
+            self.v.open_path(g)
+            self.wait_success()
+            self.assertIsNotNone(self.v._anim, "多帧 GIF 应当进入动画状态")
+            self.assertIn("动图", self.v.status_right.get())
+            ok = helpers.wait_until(lambda: self.v._anim_i >= 2,
+                                    timeout=10, pump=self.pump)
+            self.assertTrue(ok, "动画帧没有推进")
+            self.v.toggle_anim_pause()
+            self.assertTrue(self.v._anim_paused)
+            frozen = self.v._anim_i
+            self.pump(10)
+            self.assertEqual(frozen, self.v._anim_i, "暂停后帧不应继续推进")
+            # 翻到下一张：动画必须停止并清理
+            self.v.next_image()
+            self.wait_success()
+            self.assertIsNone(self.v._anim)
+            self.assertIsNone(self.v._anim_job)
         finally:
             shutil.rmtree(d, ignore_errors=True)
 

@@ -199,6 +199,12 @@ class ViewerWindow:
         self._resize_job = None
         self._drag_start = None
 
+        # ---- 动图状态 ----
+        self._anim = None          # {"frames": [...], "durations": [...]}
+        self._anim_i = 0
+        self._anim_job = None
+        self._anim_paused = False
+
         self._build_window()
         self._poll()
 
@@ -298,6 +304,7 @@ class ViewerWindow:
         self.top.bind("<f>", lambda _e: self.fit_view())
         self.top.bind("<F>", lambda _e: self.fit_view())
         self.top.bind("<1>", lambda _e: self._set_zoom(1.0))
+        self.top.bind("<space>", lambda _e: self.toggle_anim_pause())
         self.top.bind("<F11>", lambda _e: self.toggle_fullscreen())
         self.top.bind("<Escape>", self._on_escape)
         self.top.protocol("WM_DELETE_WINDOW", self.close)
@@ -370,6 +377,7 @@ class ViewerWindow:
         self.pil = None
         self.display = None
         self.rotation = 0
+        self._stop_anim()
         self._fail_streak = 0
         path = self.images[index]
         try:
@@ -398,14 +406,28 @@ class ViewerWindow:
     # ---------------- 解码线程 ----------------
 
     def _decode_worker(self, token, index, path):
-        """后台解码。只往队列放结果，绝不碰控件。"""
+        """后台解码。只往队列放结果，绝不碰控件。
+
+        动图（GIF）在这里把**全部帧**解出来 —— 带硬上限（帧数 × 总像素），
+        超限就放弃动画只取第一帧：宁可不动，也不能吃内存吃到死。
+        """
         try:
             with Image.open(path) as im:
                 im.load()
                 fmt = im.format or ""
-                img = ImageOps.exif_transpose(im)   # 手机竖拍靠 EXIF 方向标记
+                frames = durations = None
+                if getattr(im, "is_animated", False):
+                    n = im.n_frames
+                    if n <= 200 and im.size[0] * im.size[1] * n <= 60_000_000:
+                        frames, durations = [], []
+                        for i in range(n):
+                            im.seek(i)
+                            frames.append(_normalize_mode(im.copy()))
+                            durations.append(max(20, int(im.info.get("duration") or 100)))
+                        im.seek(0)      # 下面还要取第一帧当静态底图
+                img = ImageOps.exif_transpose(im)
             img = _normalize_mode(img)
-            self.queue.put(("img", token, index, img, fmt))
+            self.queue.put(("img", token, index, img, fmt, frames, durations))
         except Exception as exc:
             self.queue.put(("img_err", token, index, str(exc)))
 
@@ -449,18 +471,27 @@ class ViewerWindow:
     def _handle(self, item):
         kind = item[0]
         if kind == "img":
-            _, token, index, img, fmt = item
+            _, token, index, img, fmt, frames, durations = item
             if token != self._load_token or index != self.index:
                 return                       # 过期结果：已经翻页了，丢弃
             self.pil = img
             self.fmt = fmt
             self._fail_streak = 0
             self.rotation = 0
+            self._stop_anim()
             self.display = img
+            if frames:
+                self._anim = {"frames": frames, "durations": durations}
+                self._anim_i = 0
+                self._anim_paused = False
             self._placeholder_text = "打开图片或文件夹开始浏览"
             self._apply_fit()
             self._render()
             self._update_status()
+            if self._anim:
+                # 第一帧停够它自己的时长再开始推进
+                self._anim_job = self.top.after(
+                    self._anim["durations"][0], self._anim_step)
         elif kind == "img_err":
             _, token, index, message = item
             if token != self._load_token or index != self.index:
@@ -650,6 +681,48 @@ class ViewerWindow:
         else:
             self.close()
 
+    # ---------------- 动图 ----------------
+
+    def _anim_step(self):
+        """推进到下一帧。在主线程由 after 调度 —— 帧切换本质上也是一次重渲染。"""
+        self._anim_job = None
+        if self._closed or not self._anim or self._anim_paused:
+            return
+        frames = self._anim["frames"]
+        self._anim_i = (self._anim_i + 1) % len(frames)
+        self.display = frames[self._anim_i]
+        if self.rotation:
+            self.display = self.display.transpose(_ROTATE[self.rotation])
+        self._render()
+        self._update_status()
+        self._anim_job = self.top.after(
+            self._anim["durations"][self._anim_i], self._anim_step)
+
+    def toggle_anim_pause(self, *_):
+        """空格：播放 / 暂停。没有动图时按了也没反应。"""
+        if not self._anim:
+            return
+        self._anim_paused = not self._anim_paused
+        if self._anim_job is not None:
+            try:
+                self.top.after_cancel(self._anim_job)
+            except Exception:
+                pass
+            self._anim_job = None
+        if not self._anim_paused:
+            self._anim_job = self.top.after(50, self._anim_step)
+        self._update_status()
+
+    def _stop_anim(self):
+        if self._anim_job is not None:
+            try:
+                self.top.after_cancel(self._anim_job)
+            except Exception:
+                pass
+            self._anim_job = None
+        self._anim = None
+        self._anim_paused = False
+
     def _on_canvas_configure(self, _e):
         """窗口尺寸变化。防抖：连续拖边框时不必每一像素都重算一遍。"""
         if self._resize_job is not None:
@@ -726,9 +799,16 @@ class ViewerWindow:
         self.status_left.set(left)
 
         dims = ("%d × %d" % self.pil.size) if self.pil is not None else "?"
-        fmt = "GIF（显示第一帧）" if self.fmt == "GIF" else (self.fmt or "?")
+        if self.fmt == "GIF" and self._anim:
+            n = len(self._anim["frames"])
+            fmt_txt = "GIF 动图（%d 帧，%s）" % (
+                n, "已暂停" if self._anim_paused else "播放中")
+        elif self.fmt == "GIF":
+            fmt_txt = "GIF（显示第一帧）"
+        else:
+            fmt_txt = self.fmt or "?"
         self.status_right.set("%s   %s   %s   %d%%"
-                              % (fmt, dims, format_size(self._current_bytes),
+                              % (fmt_txt, dims, format_size(self._current_bytes),
                                  round(self.zoom * 100)))
 
     def _update_nav_buttons(self):
@@ -749,6 +829,7 @@ class ViewerWindow:
         if self._closed:
             return
         self._closed = True
+        self._stop_anim()
         try:
             self.top.destroy()
         except tk.TclError:
