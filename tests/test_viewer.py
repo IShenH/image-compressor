@@ -314,11 +314,17 @@ class GuiTest(unittest.TestCase):
         self.assertEqual(V.ZOOM_MIN, self.v.zoom)
 
     def test_zoom_anchor_keeps_image_point_stable(self):
-        """以某点为锚缩放：锚点下面的图像点缩放前后必须是同一个点。"""
+        """以某点为锚缩放：锚点下面的图像点缩放前后必须是同一个点。
+
+        锚点取**画布中心** —— fit 之后图必然覆盖中心；
+        取靠边的坐标会落进居中留白，那里被钳制居中、稳定性本来就不成立
+        （窗口宽度变化曾让这个测试偶发撞上）。
+        """
         self.v.open_path(self.big)
         self.wait_success()
         self.v.fit_view()
-        ax, ay = 150, 100
+        vw, vh = self.v._viewport()
+        ax, ay = vw // 2, vh // 2
         z0, (ox0, oy0) = self.v.zoom, self.v.offset
         self.v._set_zoom(3.0, anchor=(ax, ay))
         p0 = ((ax - ox0) / z0, (ay - oy0) / z0)
