@@ -24,6 +24,7 @@
 import math
 import os
 import queue
+import sys
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox
@@ -938,3 +939,22 @@ class ViewerWindow:
             self.top.destroy()
         except tk.TclError:
             pass
+
+
+if __name__ == "__main__":
+    # 开发用独立入口：python viewer.py [图片或文件夹路径]
+    # import main 只为复用它的 DPI 两板斧（模块层面仍是 viewer 不依赖 main）；
+    # 产品上不提供独立分发，「文件关联」属安装器级决定，见 TASKS 遗留。
+    import main as _main
+
+    import ui_theme as _T
+
+    _main.enable_dpi_awareness()
+    _root = tk.Tk()
+    _main.apply_tk_scaling(_root)
+    _T.init(_root)
+    _root.withdraw()
+    _win = ViewerWindow(_root, on_compress=None)
+    if len(sys.argv) > 1:
+        _win.open_path(sys.argv[1])
+    _root.mainloop()
