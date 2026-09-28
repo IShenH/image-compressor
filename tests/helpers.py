@@ -137,3 +137,20 @@ def wait_until(predicate, timeout=60.0, pump=None):
             return True
         time.sleep(0.01)
     return predicate()
+
+
+def make_exif_jpeg(path, size=(400, 160), orientation=6):
+    """造一张带 EXIF 方向标记的 JPEG（手工拼最小 EXIF：IFD 里只有 Orientation 一项）。
+
+    orientation=6 表示「显示时需顺时针转 90°」—— 400×160 的横图应当显示成竖图。
+    """
+    import struct
+
+    img = Image.new("RGB", size, (90, 140, 200))
+    tiff = struct.pack("<HHI", 0x4949, 42, 8)          # II, 42, IFD 偏移 8
+    tiff += struct.pack("<H", 1)                       # 1 个条目
+    tiff += struct.pack("<HHI", 0x0112, 3, 1)          # Orientation, SHORT, 1 个
+    tiff += struct.pack("<HH", orientation, 0)         # 值（SHORT 占前 2 字节）
+    tiff += struct.pack("<I", 0)                       # 下一个 IFD：无
+    img.save(path, "JPEG", exif=b"Exif\x00\x00" + tiff)
+    return path

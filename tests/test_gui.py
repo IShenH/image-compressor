@@ -350,6 +350,19 @@ class GuiTest(unittest.TestCase):
         self.app.do_save()
         self.pump()
 
+    # ---------------- EXIF 方向 ----------------
+
+    def test_preview_respects_exif_orientation(self):
+        """手机竖拍靠 EXIF 方向标记正立显示：预览必须跟着转，不能躺着。"""
+        p = helpers.make_exif_jpeg(os.path.join(self.work, "rot.jpg"),
+                                   (400, 160), orientation=6)
+        self.app.load_file(p)
+        self.pump()
+        self.assertIsNotNone(self.app.thumb_pil)
+        self.assertLess(self.app.thumb_pil.width, self.app.thumb_pil.height,
+                        "EXIF 方向 6 的横图，预览应当显示为竖图")
+        # 信息行显示的是文件里的存储尺寸（这是「文件实际内容」的事实）
+        self.assertEqual("400 × 160", self.app.info_vars["dimensions"].get())
 
     # ---------------- 布局不变量 ----------------
 

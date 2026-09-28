@@ -25,7 +25,7 @@ import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox
 
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageOps
 
 import compressor
 import ui_draw
@@ -747,6 +747,9 @@ class App:
         m = T.M
         try:
             with Image.open(path) as img:
+                # 手机竖拍靠 EXIF 方向标记正立显示。预览必须跟着转正，
+                # 否则预览躺着、压出来的结果却是正的 —— 界面在骗人。
+                img = ImageOps.exif_transpose(img)
                 img = img.convert("RGBA")
                 # 存三倍大小，重排时重新裁切不会糊
                 img.thumbnail((m.preview_w * 3, m.preview_h * 3), Image.LANCZOS)
