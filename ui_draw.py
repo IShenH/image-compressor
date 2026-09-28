@@ -363,6 +363,17 @@ def _p_rotate(d, u, w, c):
     d.polygon([(14.8 * u, 3.2 * u), (19.8 * u, 5.8 * u), (15.2 * u, 9.2 * u)], fill=c)
 
 
+def _p_trash(d, u, w, c):
+    """垃圾桶（删除）"""
+    d.line([(5 * u, 7 * u), (19 * u, 7 * u)], fill=c, width=w)
+    d.line([(9 * u, 7 * u), (9 * u, 4.5 * u), (15 * u, 4.5 * u), (15 * u, 7 * u)],
+           fill=c, width=w, joint="curve")
+    d.line([(6.5 * u, 7 * u), (7.5 * u, 20 * u), (16.5 * u, 20 * u), (17.5 * u, 7 * u)],
+           fill=c, width=w, joint="curve")
+    d.line([(10.2 * u, 10.5 * u), (10.6 * u, 16.5 * u)], fill=c, width=w)
+    d.line([(13.8 * u, 10.5 * u), (13.4 * u, 16.5 * u)], fill=c, width=w)
+
+
 _PAINTERS = {
     "file": _p_file,
     "tag": _p_tag,
@@ -382,6 +393,7 @@ _PAINTERS = {
     "arrow_left": _p_arrow_left,
     "arrow_right": _p_arrow_right,
     "rotate": _p_rotate,
+    "trash": _p_trash,
 }
 
 ICON_NAMES = tuple(sorted(_PAINTERS))

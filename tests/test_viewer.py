@@ -15,6 +15,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)                        # tests/ 自身（helpers）
@@ -444,6 +445,86 @@ class GuiTest(unittest.TestCase):
         self.v.close()
         self.pump()
         self.assertFalse(self.v.top.winfo_exists())
+
+    # ---------------- 删除 ----------------
+
+    def test_delete_confirmed_then_recycled_and_advances(self):
+        """确认删除 → 移入回收站（此处 mock）、列表收缩、停在原位置的下一张。"""
+        d = tempfile.mkdtemp(prefix="viewer_del_")
+        try:
+            paths = [os.path.join(d, n) for n in ("a.jpg", "b.jpg", "c.jpg")]
+            for p in paths:
+                make_img(p, (60, 40))
+            self.v.open_path(paths[1])        # 打开中间那张
+            self.wait_success()
+            recycled = []
+
+            def fake_recycle(p):
+                # 模拟回收站行为：从原位置消失。真实回收站路径已单独实测。
+                os.remove(p)
+                recycled.append(p)
+                return True
+
+            with mock.patch.object(V, "_recycle", side_effect=fake_recycle), \
+                 mock.patch.object(V.messagebox, "askyesno", return_value=True):
+                self.v.delete_current()
+            self.pump()
+            self.assertEqual([paths[1]], recycled)
+            self.assertFalse(os.path.exists(paths[1]), "文件应从原位置移除")
+            self.assertEqual(2, len(self.v.images))
+            self.assertEqual(1, self.v.index)
+            self.wait_success()
+            self.assertIn("c.jpg", self.v.status_left.get())
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_delete_cancelled_keeps_file(self):
+        d = tempfile.mkdtemp(prefix="viewer_del2_")
+        try:
+            p = os.path.join(d, "keep.jpg")
+            make_img(p, (60, 40))
+            self.v.open_path(p)
+            self.wait_success()
+            with mock.patch.object(V, "_recycle", side_effect=AssertionError("不该调用")), \
+                 mock.patch.object(V.messagebox, "askyesno", return_value=False):
+                self.v.delete_current()
+            self.pump()
+            self.assertTrue(os.path.exists(p))
+            self.assertEqual(1, len(self.v.images))
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_delete_failure_is_reported_and_keeps_file(self):
+        d = tempfile.mkdtemp(prefix="viewer_del3_")
+        try:
+            p = os.path.join(d, "stuck.jpg")
+            make_img(p, (60, 40))
+            self.v.open_path(p)
+            self.wait_success()
+            with mock.patch.object(V, "_recycle", return_value=False), \
+                 mock.patch.object(V.messagebox, "askyesno", return_value=True):
+                self.v.delete_current()
+            self.pump()
+            self.assertTrue(os.path.exists(p), "删除失败时文件必须还在")
+            self.assertIn("删除失败", self.v.status_left.get())
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_delete_last_image_shows_empty_state(self):
+        d = tempfile.mkdtemp(prefix="viewer_del4_")
+        try:
+            p = os.path.join(d, "only.jpg")
+            make_img(p, (60, 40))
+            self.v.open_path(p)
+            self.wait_success()
+            with mock.patch.object(V, "_recycle", return_value=True), \
+                 mock.patch.object(V.messagebox, "askyesno", return_value=True):
+                self.v.delete_current()
+            self.pump()
+            self.assertEqual(-1, self.v.index)
+            self.assertIn("disabled", self.v.compress_btn.state())
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
 
 
 if __name__ == "__main__":

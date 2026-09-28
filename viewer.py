@@ -26,7 +26,7 @@ import os
 import queue
 import threading
 import tkinter as tk
-from tkinter import filedialog
+from tkinter import filedialog, messagebox
 
 from PIL import Image, ImageOps, ImageTk
 
@@ -161,6 +161,39 @@ _ROTATE = {
 }
 
 
+def _recycle(path):
+    """把文件送进回收站，而不是直接抹掉 —— 可恢复才配叫「删除」。
+
+    用 shell 的 SHFileOperationW：FOF_ALLOWUNDO 进回收站、
+    NOCONFIRMATION 跳过系统确认（应用已自己确认过）、
+    SILENT / NOERRORUI 让进度和报错由我们自己管。
+    pFrom 要求**双 null** 结尾，所以用 create_unicode_buffer 多补一个。
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class SHFILEOPSTRUCTW(ctypes.Structure):
+            _fields_ = [("hwnd", wintypes.HWND),
+                        ("wFunc", wintypes.UINT),
+                        ("pFrom", wintypes.LPCWSTR),
+                        ("pTo", wintypes.LPCWSTR),
+                        ("fFlags", ctypes.c_short),
+                        ("fAnyOperationsAborted", wintypes.BOOL),
+                        ("hNameMappings", ctypes.c_void_p),
+                        ("lpszProgressTitle", wintypes.LPCWSTR)]
+
+        op = SHFILEOPSTRUCTW()
+        op.wFunc = 3                                    # FO_DELETE
+        buf = ctypes.create_unicode_buffer(path + "\x00")
+        op.pFrom = ctypes.cast(buf, wintypes.LPCWSTR)
+        op.fFlags = 0x40 | 0x10 | 0x4 | 0x400
+        res = ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op))
+        return res == 0 and not op.fAnyOperationsAborted
+    except Exception:
+        return False
+
+
 class ViewerWindow:
     """一个独立窗口。复用方式：open_path() 换一批图片，窗口不重建。"""
 
@@ -225,11 +258,11 @@ class ViewerWindow:
             pass
 
         sw, sh = self.top.winfo_screenwidth(), self.top.winfo_screenheight()
-        w = min(m.s(700), sw - m.s(24))
+        w = min(m.s(760), sw - m.s(24))
         h = min(m.s(460), sh - m.s(80))
         self.top.geometry("%dx%d+%d+%d" % (w, h,
                                            max(0, (sw - w) // 2), max(0, (sh - h) // 2)))
-        self.top.minsize(min(m.s(680), w), min(m.s(320), h))
+        self.top.minsize(min(m.s(756), w), min(m.s(320), h))
 
         # ---- 工具栏 ----
         bar = tk.Frame(self.top, bg=T.CARD_BG)
@@ -258,6 +291,8 @@ class ViewerWindow:
         bar_btn("适应窗口", self.fit_view, 96)
         bar_btn("1:1", lambda: self._set_zoom(1.0), 52)
         bar_btn("旋转", self.rotate, 60)
+        sep()
+        self.delete_btn = bar_btn("", self.delete_current, 44, icon="trash")
         sep()
         self.compress_btn = W.FlatButton(bar, text="压缩这张", kind="primary",
                                          command=self._send_to_compress,
@@ -309,6 +344,7 @@ class ViewerWindow:
         self.top.bind("<F>", lambda _e: self.fit_view())
         self.top.bind("<1>", lambda _e: self._set_zoom(1.0))
         self.top.bind("<space>", lambda _e: self.toggle_anim_pause())
+        self.top.bind("<Delete>", lambda _e: self.delete_current())
         self.top.bind("<F11>", lambda _e: self.toggle_fullscreen())
         self.top.bind("<Escape>", self._on_escape)
         self.top.protocol("WM_DELETE_WINDOW", self.close)
@@ -864,6 +900,34 @@ class ViewerWindow:
         if self.on_compress is None or not (0 <= self.index < len(self.images)):
             return
         self.on_compress(self.images[self.index])
+
+    def delete_current(self, *_):
+        """删除当前图：确认后移入回收站（可恢复），停在原位置的下一张。"""
+        if not (0 <= self.index < len(self.images)):
+            return
+        path = self.images[self.index]
+        name = os.path.basename(path)
+        if not messagebox.askyesno("删除图片", "把这张图片移入回收站？\n%s" % name):
+            return
+        if not _recycle(path):
+            self.status_left.set("删除失败：%s" % name)
+            return
+        idx = self.index
+        self._stop_anim()
+        del self.images[idx]
+        self._rebuild_strip()           # 列表变了：缩略图与预读全部重建
+        if not self.images:
+            self.index = -1
+            self.pil = None
+            self.display = None
+            self._placeholder_text = "打开图片或文件夹开始浏览"
+            self._render()
+            self._update_status()
+            self._update_nav_buttons()
+            self.top.title("图片查看")
+            return
+        self.index = -1
+        self._goto(min(idx, len(self.images) - 1))
 
     def close(self):
         if self._closed:
