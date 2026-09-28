@@ -344,6 +344,25 @@ def _p_check(d, u, w, c):
            fill=c, width=w, joint="curve")
 
 
+def _p_arrow_left(d, u, w, c):
+    """左箭头（上一张）"""
+    d.line([(15 * u, 5 * u), (8.5 * u, 12 * u), (15 * u, 19 * u)],
+           fill=c, width=w, joint="curve")
+
+
+def _p_arrow_right(d, u, w, c):
+    """右箭头（下一张）"""
+    d.line([(9 * u, 5 * u), (15.5 * u, 12 * u), (9 * u, 19 * u)],
+           fill=c, width=w, joint="curve")
+
+
+def _p_rotate(d, u, w, c):
+    """旋转（顺时针循环箭头）"""
+    d.arc([4.5 * u, 4.5 * u, 19.5 * u, 19.5 * u], start=300, end=215, fill=c, width=w)
+    # 弧线起点在右上（300°），箭头画在那里、指向顺时针切线方向
+    d.polygon([(14.8 * u, 3.2 * u), (19.8 * u, 5.8 * u), (15.2 * u, 9.2 * u)], fill=c)
+
+
 _PAINTERS = {
     "file": _p_file,
     "tag": _p_tag,
@@ -360,6 +379,9 @@ _PAINTERS = {
     "compress": _p_compress,
     "info": _p_info,
     "check": _p_check,
+    "arrow_left": _p_arrow_left,
+    "arrow_right": _p_arrow_right,
+    "rotate": _p_rotate,
 }
 
 ICON_NAMES = tuple(sorted(_PAINTERS))

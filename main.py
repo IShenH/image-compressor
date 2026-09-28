@@ -31,10 +31,11 @@ import compressor
 import ui_draw
 import ui_theme as T
 import ui_widgets as W
+import viewer
 
 
 # 版本号。改这里的同时要更新 CHANGELOG.md
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 
 # 档位：压缩逻辑使用的键名 → 界面显示名称、说明、图标。
@@ -144,6 +145,7 @@ class App:
         self.queue = queue.Queue()
         self.busy = False
         self.input_widgets = []   # 压缩期间需要一并禁用的控件
+        self._viewer = None       # 查看器窗口；关掉后 winfo_exists 会变假
 
         self.thumb = None         # 预览缩略图的 PhotoImage，必须留引用
         self._show_pos = {}       # 控件 → 摆放参数（显隐时要用）
@@ -202,7 +204,8 @@ class App:
         hint = m.s(22)            # 灰提示行
 
         heights = {
-            "drop": m.s(130),
+            # 拖放区：两行文字 + 一行按钮（选择 / 查看），见 _draw_background
+            "drop": m.s(140),
             "info": header + max(m.preview_h, len(INFO_ROWS) * row) + 2 * m.card_pad_y,
             "level": header + m.card_h + hint + 2 * m.card_pad_y,
             "size": header + m.btn_h_small + hint + 2 * m.card_pad_y,
@@ -294,21 +297,25 @@ class App:
                                      outline=T.BORDER, width=1), (x, y))
 
         # ---- 拖放区（虚线框，表示可拖入）----
-        # 文案在左、按钮在右，压成一行 —— 最省高度，也最接近设计稿的横向排布
+        # 文案在上、两个按钮（选择 / 查看）在下 —— 单行放不下两个按钮
+        #（467 逻辑 px 的窗口宽度减去内边距后只剩 379 逻辑 px）
         x, y, w, h = self.rects["drop"]
         bg.alpha_composite(
             ui_draw.dashed_round_rect((w, h), m.radius, color=T.DASH_BORDER,
                                       width=1, dash=6, gap=5), (x, y))
         d = ImageDraw.Draw(bg)
         left = x + m.s(44)
-        d.text((left, y + h // 2 - m.s(15)), "选择图片或拖拽到这里",
+        d.text((left, y + m.s(26)), "选择图片或拖拽到这里",
                font=T.pil_font(24, bold=True), fill=T.TEXT_STRONG, anchor="lm")
-        d.text((left, y + h // 2 + m.s(16)), "支持常见的图片格式（JPG、PNG、WEBP 等）",
+        d.text((left, y + m.s(56)), "支持常见的图片格式（JPG、PNG、WEBP 等）",
                font=T.pil_font(18), fill=T.TEXT_MUTED, anchor="lm")
-        btn_w, btn_h = m.s(250), m.s(66)
         # 按钮位置记下来，_apply_positions 要用
-        self.drop_btn = (x + w - m.s(44) - btn_w, y + (h - btn_h) // 2,
-                         btn_w, btn_h)
+        btn_h = m.btn_h_small
+        by = y + m.s(84)
+        self.drop_btns = [
+            (left, by, m.s(150), btn_h),               # 选择图片…（主按钮）
+            (left + m.s(150) + m.s(12), by, m.s(120), btn_h),  # 查看图片
+        ]
 
         # ---- 各卡片内的静态内容 ----
         self.header_h["info"] = self._draw_header(bg, "info", "image", "原图信息")
@@ -475,13 +482,20 @@ class App:
         self.result_vars = {k: tk.StringVar(value="—") for k in
                             ("before", "after", "saved", "format", "dimensions")}
 
-        self.choose_btn = W.FlatButton(self.bg, text="选择图片…", icon="folder",
+        # 按钮宽度有限（拖放区一行放两个），不再配图标
+        self.choose_btn = W.FlatButton(self.bg, text="选择图片…", icon=None,
                                        kind="primary", command=self.choose_file,
                                        bg=T.PAGE_BG)
+        self.view_btn = W.FlatButton(self.bg, text="查看图片", icon=None,
+                                     kind="secondary", command=self._open_viewer,
+                                     bg=T.PAGE_BG)
         # 预览框用 Canvas 自己画（圆角底 + 图片或占位图标）。
         # 不用 Label 贴图：Label 的背景是方的，盖不住背景图上的圆角框，会露出直角。
         self.preview = tk.Canvas(self.bg, bg=T.CARD_BG, bd=0,
                                  highlightthickness=0)
+        # 双击预览框 = 大图查看（有图才响应）
+        self.preview.bind("<Double-Button-1>",
+                          lambda _e: self._open_viewer() if self.info else None)
         self.thumb_pil = None      # 原始缩略图（PIL）；重排时重新合成
         self.thumb = None          # 最终贴上去的 PhotoImage
         self._thumb_ver = 0
@@ -539,10 +553,12 @@ class App:
         """按最新算出的坐标摆放全部控件，并同步与布局相关的尺寸。"""
         m = T.M
 
-        # ---- 拖放区：文案在左、按钮在右 ----
-        bx, by, bw, bh = self.drop_btn
+        # ---- 拖放区：文字在上，选择 / 查看两个按钮一行在下 ----
+        (bx, by, bw, bh), (vx, vy, vw_, vh_) = self.drop_btns
         self.choose_btn.configure(width=bw, height=bh)
         self._reg(self.choose_btn, x=bx, y=by)
+        self.view_btn.configure(width=vw_, height=vh_)
+        self._reg(self.view_btn, x=vx, y=vy)
 
         # ---- 原图信息：预览框 + 四个数值 ----
         bx, by, pw, ph = self.preview_box
@@ -782,6 +798,51 @@ class App:
         )
         if path:
             self.load_file(path)
+
+    # ---------------- 查看器 ----------------
+
+    def _open_viewer(self, path=None):
+        """打开（或复用）查看器窗口。
+
+        已加载图片时直接浏览它所在的文件夹 —— 「下一张」天然可用；
+        没有图片时先弹文件选择框，取消就不开窗口。
+        """
+        if path is None and self.info is None:
+            path = filedialog.askopenfilename(
+                title="选择要查看的图片",
+                filetypes=[("所有支持的图片",
+                            "*.jpg *.jpeg *.png *.webp *.bmp *.gif *.tif *.tiff"),
+                           ("所有文件", "*.*")],
+            )
+            if not path:
+                return
+        v = self._viewer
+        if v is not None:
+            try:
+                if not v.winfo_exists():
+                    v = None
+            except tk.TclError:
+                v = None
+        if v is None:
+            v = viewer.ViewerWindow(self.root, on_compress=self._compress_from_viewer)
+            self._viewer = v
+        if path is not None:
+            v.open_path(path)
+        elif self.info is not None:
+            v.open_path(self.info.path)
+        v.top.deiconify()
+        v.top.lift()
+        v.top.focus_force()
+
+    def _compress_from_viewer(self, path):
+        """查看器点「压缩这张」：把图送进主窗口。压缩进行中就请用户等一等。"""
+        if self.busy:
+            messagebox.showinfo("正在压缩", "请等当前压缩完成，再从查看器送图。")
+            return
+        self.load_file(path)
+        self.root.deiconify()
+        self.root.lift()
+        self.root.focus_force()
 
     def load_file(self, path):
         """读入一张图片并刷新界面。对话框之外的逻辑都集中在这里。"""
